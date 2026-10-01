@@ -110,8 +110,9 @@ class GlmEngine:
 
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                 prefill_rows: int | None = None) -> None:
-        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
+                 prefill_rows: int | None = None, parallel: int = 1) -> None:
+        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests);
+        ``parallel``: requests decoded together (``multi``: their caches share one pool, each stream up to the context window; DFlash2 drafts only)."""
 
         import torch
 
@@ -135,7 +136,10 @@ class GlmEngine:
         # Without --context the window stays dense, attending every key without indexer work.
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         from . import LATENT
-
+        parallel = int(parallel)
+        if not 1 <= parallel <= 4:
+            raise ValueError(f"--parallel: 1 to 4 requests at once for GLM-5.3-Flash, not {parallel}")
+        self.parallel = parallel
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
         weights_estimate = split_weights(rule)
@@ -190,9 +194,26 @@ class GlmEngine:
 
             self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
-                        long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
+                        long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else (),
+                        streams=parallel, pool_rows=capacity if parallel > 1 else None)
         if self.drafter is not None:
             self.drafter.capture()
+        if parallel > 1:
+            from .multi import GlmScheduler, MultiDecoder
+
+            self.multi = MultiDecoder(self, parallel)
+            self.multi.model_dir = self.model_dir
+            if rank == 0:
+                self.scheduler = GlmScheduler(self.multi, max_streams=parallel)
+                self.concurrent = True
+                print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
+                      f"in one pool of {capacity} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
+                      f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
+                      f"{self.multi.share:g})", flush=True)
+        else:
+            self.multi = None
+            self.scheduler = None
+            self.concurrent = False
         self.costs = self._calibrate()
         if rank == 0:
             c = self.costs
@@ -482,8 +503,8 @@ class GlmEngine:
         return stats
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None) -> dict[str, Any]:
-        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal."""
+                 constraint=None, *, background: bool = False) -> dict[str, Any]:
+        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``background``: under --parallel, after the other requests and yielding to them."""
 
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
@@ -495,6 +516,14 @@ class GlmEngine:
         code = self._effective(encode_policy(spec))
         stop_eos = bool(getattr(self.request, "stop_eos", True))
         hit = self._resume(list(prompt), code) if draft else None
+        if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
+            if constraint is not None and self.vision is None:
+                raise ValueError("image inputs require starting this server with --vision")
+            stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
+                                          on_tokens, stop_eos=stop_eos, vision=constraint, constraint=constraint,
+                                          background=background, glm={"code": code, "spec": spec})
+            stats.update(policy=spec, drafts=draft)
+            return stats
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
@@ -514,6 +543,10 @@ class GlmEngine:
 
     def follow(self) -> None:
         """Rank 1: mirror every request rank 0 serves, forever."""
+
+        if self.multi is not None:
+            self.multi.follow()
+            return
 
         from tensorfold.engine.exact_sampling import Sampling
 
