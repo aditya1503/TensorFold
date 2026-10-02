@@ -3,6 +3,40 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## 0.6.2 (2 Oct 2026)
+
+- **Flash Next on Macs at 64k-128k.** On an M3 Ultra, one stream runs 1.2-3.4% faster at 64k and 3.9-5.5% at 128k,
+  with the same tokens: a window's n-gram ids are hashed on the GPU, and the chain's first step is built while the
+  GPU verifies.
+- **27B with several streams on CUDA.** The GDN tree kernel takes 8-35% less time with the same bits. On an RTX PRO
+  6000 at its 250 W limit, 4 and 8 streams of the NVFP4 27B decode 1.1-4.2% faster.
+- **Fixes:** the config check accepts the FP8 n-gram table in NVIDIA's MIXED_PRECISION Flash Next export; GLM-5.3
+  on CUDA counts its drafts in `/health`, `/metrics` and replies, and names a mixed-bit EXL3 checkpoint when it
+  refuses one; a client that leaves is noticed past file descriptor 1023; the CUDA server prints a line a request, as
+  the Mac server does; a failed snapshot write no longer leaves its partial file; Gemma 4's QKV kernel reserves its
+  1024 threads for M1, M2 and macOS VMs, and a VM's GPU is no longer taken for an M5.
+
+## 0.6.1 (1 Oct 2026)
+
+- **NVFP4 checkpoints in their own math.** `nvidia/Qwen3.8-27B-NVFP4` runs the 4-bit activations its checkpoint
+  names, as vLLM does; `--precision full` runs 16-bit activations against the same weights. On an RTX PRO 6000 at its
+  250 W limit, one stream decodes 1.4-2.0x vLLM and prompts fill at 0.95-0.97x its speed.
+- **Waiting prompts fill together on CUDA.** With `--parallel`, prompts that arrive together now share one prefill
+  forward instead of filling one a round: on an RTX PRO 6000 at its 250 W limit, 8 streams of the 27B run 1.14-1.36x
+  faster and the slowest first token comes in 0.05-0.10 s instead of 0.4-0.8 s (1.6 s to 0.15 s on a DGX Spark), with
+  the same replies.
+- **More 27B tokens with several streams on CUDA.** Streams plan on their measured round cost, and wider lane blocks
+  on RTX PRO and RTX 50 cards add 4-8% at 8 streams, with the same tokens.
+- **Flash Next on Macs at long context.** One stream runs up to 9.6% faster on code at 64k and 10.2% on chat at 128k
+  on an M3 Ultra, with the same tokens.
+- **`/v1/decisions`** scores a choice, a score or a yes/no from the next-token logits, on the shared prompt lanes.
+- **Flash Next on CUDA:** image input, forks that resume from their shared prefix, shared system prompts copied
+  instead of filled again, and short prompts admitted while a long one fills.
+- **RTX cards without Docker:** pip alone installs and builds the CUDA kernels. Native Windows is in as an
+  experimental host layer, not yet run on Windows hardware.
+- **Fixes:** a refused request no longer breaks the next one on its connection; Gemma 4 thought blocks stay out of
+  replies with thinking off; an unnamed reasoning effort goes to the nearest named level; mlx-lm 0.32 support.
+
 ## 0.6.0 (30 Sep 2026)
 
 - **RTX 40 cards.** CUDA now runs on compute capability 8.9 (Ada). On one RTX 4090 the 27B serves with DFlash2 in a
@@ -299,7 +333,7 @@ GitHub has the full notes and the measurements behind them.
 ## 0.3.2 (26 Sep 2026)
 
 - `tensorfold update` installs the newest release.
-- GLM-5.3-Flash reads Mia-AiLab's EXL3 weights on two DGX Sparks (experimental).
+- GLM-5.3-Flash reads Brandon M. Music's EXL3/TR3 weights (re-hosted by Mia-AiLab) on two DGX Sparks (experimental).
 
 ## 0.3.1 (26 Sep 2026)
 
