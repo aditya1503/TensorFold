@@ -384,7 +384,7 @@ class MultiDecoder:
         self.profile = None                              # the current round's (``profiles``), or None
         self.solo_verify = SerialVerify(e, taps=self.drafts is not None)
         graphs = getattr(e, "graphs", None)
-        self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=(0, 0))[0]
+        self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=0)
         self.row_ms = list(row_ms) if row_ms is not None else None
         if self.tune.depth == "joint" and self.row_ms is None:
             if isinstance(self.verify, BatchedVerify) and self.verify.graphs:

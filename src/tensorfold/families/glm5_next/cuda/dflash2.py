@@ -280,7 +280,6 @@ class Drafter:
         self.kc = [torch.zeros((KV, self.cap, hd), dtype=torch.bfloat16, device=dev) for _ in self.layers]
         self.vc = [torch.zeros((KV, self.cap, hd), dtype=torch.bfloat16, device=dev) for _ in self.layers]
         self.gathered = self.world                    # ranks whose top-k candidate packs merge after a block pass
-        self.tap_rows = self.tap_in.shape[0]
         self.pos_dev = torch.zeros((1,), dtype=torch.int64, device=dev)
         self.context_end = 0
         n = self.block
@@ -288,6 +287,7 @@ class Drafter:
         self.ids_host = torch.zeros((1,), dtype=torch.int32, pin_memory=torch.cuda.is_available())
         self.ar = torch.arange(max(64, n), device=dev)
         self.tap_in = torch.zeros((64, len(self.tap_layers) * self.D), dtype=torch.bfloat16, device=dev)
+        self.tap_rows = self.tap_in.shape[0]
         self.packed: torch.Tensor | None = None       # [world, block - 1, 2 * top_k] after a pass
         self.proj: torch.Tensor | None = None         # [block - 1, selector rank] fp32
         self.pool = None

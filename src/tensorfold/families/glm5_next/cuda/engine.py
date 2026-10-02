@@ -164,6 +164,8 @@ class GlmEngine:
 
         import torch
 
+        self.model_dir = Path(model_dir)
+
         from tensorfold.cuda.comm import NCCL
         from .decode import Engine
         from .weights import Config, load
@@ -313,7 +315,6 @@ class GlmEngine:
             print("[tensorfold] drafter costs (ms): verify " + " ".join(f"{v:.1f}" for v in c["verify"]) + mtp +
                   f"; DFlash2 block {c['block']:.2f} (+{c['taps_row']:.3f} a tap row)", flush=True)
         self.eos = tuple(w.cfg.eos)
-        self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
         # kept conversations (decode.Snapshot, least recently used first) and the live caches' ids; states and saved rows stay within cache_bytes
         self.cache: list = []
