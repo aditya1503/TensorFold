@@ -279,6 +279,8 @@ class Drafter:
         self.cap = self.ring or capacity + self.block
         self.kc = [torch.zeros((KV, self.cap, hd), dtype=torch.bfloat16, device=dev) for _ in self.layers]
         self.vc = [torch.zeros((KV, self.cap, hd), dtype=torch.bfloat16, device=dev) for _ in self.layers]
+        self.gathered = self.world                    # ranks whose top-k candidate packs merge after a block pass
+        self.tap_rows = self.tap_in.shape[0]
         self.pos_dev = torch.zeros((1,), dtype=torch.int64, device=dev)
         self.context_end = 0
         n = self.block

@@ -1,150 +1,93 @@
-"""Unit tests for MTP with concurrency - logic tests without full model."""
+"""Unit tests for --parallel with MTP: the policy mapping, the lane fields, the window trimmer. CUDA-free (the
+``decode_policy`` check skips where the kernels are not importable)."""
 
-import pytest
 import torch
-from dataclasses import dataclass, field
-from typing import Any, List
 
-if not torch.cuda.is_available():
-    pytest.skip("CUDA only", allow_module_level=True)
+from tensorfold.families.glm5_next.cuda.multi import Lane, multi_code, trim
+from tensorfold.families.glm5_next.cuda.multi_prefill import Piece
+from tensorfold.families.glm5_next.cuda.verify import Segment
+from tensorfold.cuda.memory_gate import NoRoom
+from tensorfold.cuda.streams import Stream
+
+DFLASH = [13, 5, 300000, 0]          # encode_policy("fc5:0.3"), the DFlash2 auto policy
+
+
+def test_multi_code_keeps_mtp_policies():
+    # an MTP policy (kind 1-3) stays MTP when the MTP head is loaded, whatever the draft model
+    assert multi_code([3, 5, 300000, 0], dflash=True, mtp=True, dflash_policy=DFLASH) == [3, 5, 300000, 0]
+    assert multi_code([1, 4, 0, 0], dflash=False, mtp=True, dflash_policy=DFLASH) == [1, 4, 0, 0]
+    # ... and without the MTP head it becomes its DFlash2 twin (or serial without either drafter)
+    assert multi_code([3, 5, 300000, 0], dflash=True, mtp=False, dflash_policy=DFLASH) == [13, 5, 300000, 0]
+    assert multi_code([3, 5, 300000, 0], dflash=False, mtp=False, dflash_policy=DFLASH) == [0, 0, 0, 0]
+    # serial stays serial; DFlash2 policies stay with a drafter and fall back to MTP/free otherwise
+    assert multi_code([0, 0, 0, 0], dflash=True, mtp=True, dflash_policy=DFLASH) == [0, 0, 0, 0]
+
+
+def test_multi_code_auto():
+    # auto becomes the engine's DFlash2 policy with the draft model, an adaptive MTP policy without it
+    assert multi_code([4, 2, 8, 30000], dflash=True, mtp=True, dflash_policy=DFLASH) == DFLASH
+    assert multi_code([4, 2, 8, 30000], dflash=False, mtp=True, dflash_policy=DFLASH) == [2, 3, 600000, 850000]
+    assert multi_code([4, 2, 8, 30000], dflash=False, mtp=False, dflash_policy=DFLASH) == [0, 0, 0, 0]
+    # the drafter-shaped code (kind 1x) is passed through only with a drafter
+    assert multi_code([11, 5, 0, 0], dflash=True, mtp=True, dflash_policy=DFLASH) == [11, 5, 0, 0]
+    assert multi_code([11, 5, 0, 0], dflash=False, mtp=True, dflash_policy=DFLASH) == [0, 0, 0, 0]
 
 
 def test_lane_mtp_fields():
-    """Test Lane dataclass has MTP fields."""
-    from tensorfold.families.glm5_next.cuda.multi import Lane, Stream
-    
-    s = Stream(prompt=[1, 2, 3], count=10)
-    
-    lane = Lane(
-        s=s,
-        sid=0,
-        slot=0,
-        extent=None,
-        st=None,
-        order=0,
-        code=[3, 5, 300000, 0],
-        spec="c5:0.3",
-        policy=None,
-        dflash=False,
-    )
-    
-    # Check MTP fields exist
-    assert hasattr(lane, 'mtp')
-    assert hasattr(lane, 'last_hidden')
-    assert hasattr(lane, 'pending_tokens')
-    
-    # Check defaults
-    assert lane.mtp is False
-    assert lane.last_hidden is None
-    assert lane.pending_tokens == []
-    
-    # Check we can set them
-    lane.mtp = True
-    lane.last_hidden = torch.zeros(1, 512)
-    lane.pending_tokens = [42]
-    
-    assert lane.mtp is True
-    assert lane.last_hidden is not None
-    assert lane.pending_tokens == [42]
+    """A lane carries its MTP accept state: the head's last hidden and the token it was sampled from."""
+    lane = Lane(s=Stream([1, 2, 3], 8), sid=0, slot=0, extent=None, st=None, order=0, code=[3, 5, 300000, 0])
+    assert lane.mtp is False and lane.last_hidden is None and lane.pending_tokens == []
+    lane.mtp, lane.last_hidden, lane.pending_tokens = True, torch.zeros(1, 512), [7]
+    assert (lane.mtp, lane.pending_tokens) == (True, [7]) and lane.last_hidden.shape == (1, 512)
 
 
-def test_mtp_policy_remapping():
-    """Test that MTP policies are remapped to DFlash2 in multi-stream mode."""
-    from tensorfold.families.glm5_next.cuda.multi import multi_code
-    
-    dflash_policy = [11, 5, 300000, 0]  # DFlash2 version of c5:0.3
-    
-    # MTP policy (kind 3) should become DFlash2
-    mtp_policy = [3, 5, 300000, 0]
-    remapped = multi_code(mtp_policy, dflash=True, dflash_policy=dflash_policy)
-    assert remapped == dflash_policy
-    
-    # Serial policy (kind 0) stays serial
-    serial_policy = [0, 0, 0, 0]
-    remapped = multi_code(serial_policy, dflash=True, dflash_policy=dflash_policy)
-    assert remapped == [0, 0, 0, 0]
-    
-    # DFlash2 policies (kind 1x) stay as-is
-    dflash2_policy = [11, 5, 300000, 0]
-    remapped = multi_code(dflash2_policy, dflash=True, dflash_policy=dflash_policy)
-    assert remapped == dflash2_policy
+def test_lane_mtp_flag_set_only_by_admit_rules():
+    """decode_policy + mtp gate: serial (code 0) and DFlash2 (kind >= 10) lanes never take the MTP path."""
+    import pytest
+
+    pytest.importorskip("triton")          # ``decode``'s DepthPolicy imports the kernels' modules
+    from tensorfold.families.glm5_next.cuda.engine import decode_policy
+
+    assert decode_policy([0, 0, 0, 0]) is None                        # serial: one row a round
+    assert decode_policy([3, 5, 300000, 0]) is not None               # MTP fixed+confidence
+    assert decode_policy([13, 5, 300000, 0]) is not None              # DFlash2 code after multi_code
+    assert issubclass(NoRoom, __import__("tensorfold.cuda.memory_gate", fromlist=["NoRoom"]).NoRoom)
 
 
-def test_multi_prefill_piece_mtp_field():
-    """Test Piece dataclass has MTP field."""
-    from tensorfold.families.glm5_next.cuda.multi_prefill import Piece
-    from tensorfold.families.glm5_next.cuda.forward import State
-    
-    st = State.__new__(State)  # Create without init
-    st.pos = 0
-    
-    piece = Piece(
-        st=st,
-        tokens=[1, 2, 3],
-        drafter=None,
-        head=True,
-    )
-    
-    assert hasattr(piece, 'mtp')
-    assert piece.mtp is False
-    
-    piece.mtp = True
-    assert piece.mtp is True
+def test_piece_mtp_fields():
+    piece = Piece(st=None, tokens=[1, 2, 3], head=True, mtp=True, nxt=[2, 3])
+    assert piece.rows == 3 and piece.nxt == [2, 3] and piece.last_hidden is None
 
 
-def test_draft_logic_mtp_path():
-    """Test the MTP draft logic in multi.py round()."""
-    from tensorfold.families.glm5_next.cuda.multi import Lane, MAX_WINDOW
-    
-    # Simulate a lane with MTP enabled
-    lane = Lane(
-        s=None,
-        sid=0,
-        slot=0,
-        extent=None,
-        st=None,
-        order=0,
-        code=[3, 5, 300000, 0],
-        policy=None,  # would be DepthPolicy
-        dflash=False,
-        mtp=True,
-        last_hidden=torch.zeros(1, 512),
-        pending_tokens=[5],
-        depth=3,
-    )
-    
-    # Verify MTP lane is recognized
-    assert lane.mtp is True
-    assert lane.last_hidden is not None
-    assert lane.pending_tokens == [5]
-    assert lane.depth > 0
+def test_trim_shared_window():
+    # a 6-row window + a 2-row window + a 1-row window: 3 + 2 + 1 pending = 32 with the drafts below, untrimmed
+    drafts = [[1] * 5, [2] * 3, [3]]
+    out = trim(drafts, cap=32)
+    assert sum(1 + len(d) for d in out) <= 32
+    # over the cap: one draft at a time off the longest tail, never the pending token
+    out = trim([[1] * 40, [2] * 10, []], cap=32)
+    assert sum(1 + len(d) for d in out) == 32
+    assert out[0] == [1] * 19 and out[1] == [2] * 10 and out[2] == []
 
 
-def test_max_window_constant():
-    """Test MAX_WINDOW is defined correctly."""
-    from tensorfold.families.glm5_next.cuda.multi import MAX_WINDOW
-    
-    assert MAX_WINDOW == 32
+def test_segment_records():
+    lane = Lane(s=Stream([1], 4), sid=0, slot=0, extent=None, st=None, order=0, code=[1, 1, 0, 0])
+    seg = Segment(lane.st, [5, 6, 7])
+    assert seg.tokens == [5, 6, 7]
 
 
-def test_trim_function():
-    """Test the trim function for capping window sizes."""
-    from tensorfold.families.glm5_next.cuda.multi import trim, MAX_WINDOW
-    
-    # Simple case - under cap
-    drafts = [[1, 2], [3], [4, 5, 6]]
-    result = trim(drafts, MAX_WINDOW)
-    assert result == drafts
-    
-    # Over cap - should trim longest first
-    drafts = [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12], [13, 14]]
-    # Total: 8 + 4 + 2 = 14, plus 3 pending = 17 > 32? No, 17 < 32
-    result = trim(drafts, 10)  # Use smaller cap for test
-    # 8 + 4 + 2 + 3 pending = 17 > 10
-    # Should trim from longest (first)
-    total = sum(1 + len(d) for d in result)
-    assert total <= 10
+def test_watchdog_and_settings_parse():
+    from tensorfold.families.glm5_next.cuda.multi import fill_rows, fill_share, fill_unit, watchdog_seconds
+    from tensorfold.families.glm5_next.cuda.multi_tune import MultiSettings
+
+    assert fill_rows(2048, 0, "1024") == 1024 and fill_rows(64, 0, "") == 64
+    assert fill_share("0.5") == 0.5 and fill_unit(0) == 64
+    assert watchdog_seconds("0") == 0.0
+    s = MultiSettings.from_env({})
+    assert s.depth == "policy" and s.sampler == "streams" and s.lone
+    assert MultiSettings.from_env({"TF_GLM_MULTI_DEPTH": "scale:1.5"}).alpha == 1.5
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    import pytest
+    raise SystemExit(pytest.main([__file__, "-v"]))

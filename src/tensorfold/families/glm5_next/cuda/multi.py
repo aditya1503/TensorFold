@@ -384,10 +384,14 @@ class MultiDecoder:
         self.profile = None                              # the current round's (``profiles``), or None
         self.solo_verify = SerialVerify(e, taps=self.drafts is not None)
         graphs = getattr(e, "graphs", None)
-        self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=0)
+        self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=(0, 0))[0]
         self.row_ms = list(row_ms) if row_ms is not None else None
-        if self.tune.depth == "joint" and self.row_ms is None and isinstance(self.verify, BatchedVerify):
-            self.row_ms = self._time_rows()
+        if self.tune.depth == "joint" and self.row_ms is None:
+            if isinstance(self.verify, BatchedVerify) and self.verify.graphs:
+                self.row_ms = self._time_rows()
+            else:
+                raise ValueError("TF_GLM_MULTI_DEPTH=joint needs the batched verify window's graphs "
+                                 "(TF_GLM_MULTI_VERIFY=batched, TF_GLM_MULTI_GRAPHS=1)")
         # both ranks: the comparison replays graphs whose all-gathers the other rank must join (TF_GLM_MULTI_PROFILE
         # is in the two-rank settings comparison, so both run it or neither)
         if self.tune.profile and isinstance(self.verify, BatchedVerify) and self.verify.graphs and self.lone_rows:
@@ -1054,8 +1058,6 @@ class MultiDecoder:
             s.prefill_s += time.perf_counter() - t
         lane.decoding = True
         s.started = time.perf_counter()
-        if lane.policy is not None and self.g.copy is not None:
-            lane.copies = CopyDrafts(list(prompt) + [first], self.g.copy.match, self.g.copy.most)
         if lane.policy is not None:
             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
         return first
@@ -1063,16 +1065,9 @@ class MultiDecoder:
     def _started(self, lane: Lane, first: int) -> None:
         """Both ranks: the lane's prompt is in and its first token sampled: it decodes from the next round."""
 
-        from .copy_drafts import CopyDrafts
-
         s = lane.s
-        prompt = s.prompt
         lane.decoding = True
         s.started = time.perf_counter()
-        if lane.policy is not None and self.g.copy is not None:
-            c = self.g.copy                 # no pads: batched windows are not the single-stream widths
-            lane.copies = CopyDrafts(list(prompt) + [first], c.match, c.most, prompt=len(prompt),
-                                     reply_match=c.reply_match, miss_most=c.miss_most)
         if lane.policy is not None:
             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
         if lane.mtp:
