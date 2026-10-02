@@ -117,3 +117,19 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 [Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
+
+## GLM-5.3-Flash multi-stream concurrency
+
+GLM's CUDA engine takes concurrent requests (`--parallel`): the scheduler `multi.py`, the DFlash2 drafter pool
+`dflash2_multi.py`, the extent pool `pool.py`, the segmented views `segments.py`, the batched verify `verify.py`,
+the startup tuner `multi_tune.py` and the multi-prompt prefill `multi_prefill.py`, with the wiring they carry into
+the engine, forward pass and decode, are adapted from MiaAI-Lab's
+[GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+— patches [0026-0035 (the multi-stream series) and 0049-glm-multi-prefill](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/6eba2cd5d57a99475715136e7028790abb3ad084/patches),
+Apache License 2.0, Copyright (c) 2026 MiaAI-Lab. See [the license text](LICENSES/Apache-2.0.txt).
+`pool.py`, `dflash2_multi.py` and `segments.py` are the files those patches produce, docstrings included;
+`verify.py` and `multi_tune.py` are theirs with small changes; most of `multi.py` is theirs, and `multi_prefill.py`
+is theirs with MTP hooks added. TensorFold's own part is the MTP drafter under concurrency: an MTP lane drafts
+through the exact serial pipeline on its own state while DFlash2 lanes share one verify window (`multi_code` keeps
+request-owned MTP policies), plus the last row's hidden and ahead pairings `multi_prefill` feeds the MTP's first
+draft, the `most` knob of `verify.BatchedVerify.time_rows` and the tuner's MTP and profile settings.
