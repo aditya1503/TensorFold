@@ -144,52 +144,141 @@ class Buffers:
         return p
 
 
-class State:
-    """Committed caches of one sequence (and of the MTP head's attention layer)."""
+class Caches:
+    """Every per-token cache of the model over ``rows`` tokens of a shared pool (``pool.Arena``): per DSA layer its
+    latents (or keys and values without the latent cache); the MTP layer's; and with long contexts per indexed layer
+    (the DSA layers, then the MTP layer) its index keys, gates and pooled keys (a row a pool of 4 tokens, 2 rows of
+    pad). Element types and layouts are decided here; a ``State`` views them over its extent (``bind``)."""
 
-    def __init__(self, w: Weights, capacity: int, rows: int) -> None:
+    def __init__(self, w: Weights, rows: int) -> None:
+        from .pool import Arena, Plane
+
         c = w.cfg
         dev = w.device
         HL = c.heads // w.world
+        dsa = len([l for l in w.layers if l.kind == "dsa"])
+        self.latent = latent.ENABLED
+        planes: list[Plane] = []
+
+        def add(shape, div: int = 1, pad: int = 0) -> int:
+            planes.append(Plane(torch.zeros((rows // div + pad, *shape), dtype=torch.bfloat16, device=dev), div, pad))
+            return len(planes) - 1
+
+        def attention_planes() -> tuple[int, int | None]:
+            if self.latent:          # one 512-wide latent a token and layer (kc), no separate values (vc)
+                return add((c.kv_lora,)), None
+            return add((HL, c.qk_dim)), add((HL, c.v_dim))
+
+        self.kc, self.vc = [], []
+        for _ in range(dsa):
+            k, v = attention_planes()
+            self.kc.append(k)
+            self.vc.append(v)
+        self.mtp = attention_planes() if w.mtp is not None else None
+        # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys
+        self.index = None
+        if w.meta.get("long_context"):
+            n_idx = dsa + (1 if w.mtp is not None else 0)
+            self.index = [(add((c.index_dim,)), add((c.index_dim,)), add((c.index_dim,), 4, 2)) for _ in range(n_idx)]
+        self.arena = Arena(rows, planes)
+        self.rows = rows
+
+    def bind(self, st: "State", base: int, size: int) -> None:
+        """Point ``st``'s caches at tokens [base, base + size) of the pool."""
+
+        view = lambda i: None if i is None else self.arena.view(i, base, size)     # noqa: E731
+        st.kc = [view(i) for i in self.kc]
+        st.vc = [view(i) for i in self.vc]
+        if self.mtp is not None:
+            st.mtp_kc, st.mtp_vc = view(self.mtp[0]), view(self.mtp[1])
+        st.index = None if self.index is None else [tuple(view(i) for i in trio) for trio in self.index]
+
+
+class Slots:
+    """What each of ``count`` concurrent streams holds whatever its length: KDA recurrent states [count, 2, layers,
+    H, 128, 128] (two parities) and conv windows [count, layers, 3, C], the decode window's KDA projections and replay
+    scratch (so a window's commit can come after another stream's forward), and the device positions a captured graph
+    reads. A ``State`` in slot s views slot s."""
+
+    def __init__(self, w: Weights, count: int, rows: int) -> None:
+        c = w.cfg
+        dev = w.device
         LL = c.lin_heads // w.world
-        self.capacity = capacity
-        self.pos = 0
-        self.pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
-        self.mtp_pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
+        kda_layers = [l for l in w.layers if l.kind == "kda"]
+        n = len(kda_layers)
+        width = kda_layers[0].kda.proj.n if kda_layers else 0
+        self.count, self.rows, self.layers = count, rows, n
+        self.conv = torch.zeros((count, n, c.conv - 1, 3 * LL * 128), dtype=torch.bfloat16, device=dev)
+        self.rec = torch.zeros((count, 2, n, LL, 128, 128), dtype=torch.float32, device=dev)
+        self.proj = torch.zeros((count, n, rows, width), dtype=torch.bfloat16, device=dev)
+        self.scratch = [kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None for _ in range(count)]
+        self.pos_dev = torch.zeros((count, 1), dtype=torch.int32, device=dev)
+        self.mtp_pos_dev = torch.zeros((count, 1), dtype=torch.int32, device=dev)
+
+    def nbytes(self) -> int:
+        t = [self.conv, self.rec, self.proj, self.pos_dev, self.mtp_pos_dev]
+        s = [x for set_ in self.scratch if set_ is not None for x in (set_.out, set_.k, set_.v, set_.g, set_.b)]
+        return sum(x.numel() * x.element_size() for x in t + s)
+
+
+def slot_bytes(w: Weights, rows: int) -> int:
+    """Device bytes one more stream slot takes (``Slots``), without allocating it."""
+
+    c = w.cfg
+    LL = c.lin_heads // w.world
+    kda_layers = [l for l in w.layers if l.kind == "kda"]
+    n = len(kda_layers)
+    width = kda_layers[0].kda.proj.n if kda_layers else 0
+    DK = DV = 128
+    scratch = rows * LL * DV * 2 + rows * LL * DK * 4 + rows * LL * DV * 2 + rows * LL * DK * 4 + rows * LL * 4
+    return (n * (c.conv - 1) * 3 * LL * 128 * 2 + 2 * n * LL * 128 * 128 * 4 + n * rows * width * 2 + n * scratch
+            + 16)
+
+
+class State:
+    """Committed caches of one sequence (and of the MTP head's attention layer): views of its extent [base, base +
+    capacity) of the pool's ``Caches`` and of its stream slot (``Slots``). Without ``caches`` / ``slots`` it makes its
+    own (one sequence of ``capacity`` tokens, one slot), as it always held tensors of its own."""
+
+    def __init__(self, w: Weights, capacity: int, rows: int, *, caches: Caches | None = None, base: int = 0,
+                 slots: Slots | None = None, slot: int = 0) -> None:
+        c = w.cfg
+        dev = w.device
+        self.caches = caches if caches is not None else Caches(w, capacity)
+        self.slots = slots if slots is not None else Slots(w, 1, rows)
+        self.slot = slot
         kda_layers = [l for l in w.layers if l.kind == "kda"]
         dsa_layers = [l for l in w.layers if l.kind == "dsa"]
         self.kda_index = {l.index: i for i, l in enumerate(kda_layers)}
         self.dsa_index = {l.index: i for i, l in enumerate(dsa_layers)}
         n = len(kda_layers)
-        width = kda_layers[0].kda.proj.n if kda_layers else 0
-        self.conv = torch.zeros((n, c.conv - 1, 3 * LL * 128), dtype=torch.bfloat16, device=dev)
-        self.rec = torch.zeros((2, n, LL, 128, 128), dtype=torch.float32, device=dev)
+        sl = self.slots
+        self.pos = 0
+        self.pos_dev = sl.pos_dev[slot]
+        self.mtp_pos_dev = sl.mtp_pos_dev[slot]
+        self.conv = sl.conv[slot]
+        self.rec = sl.rec[slot]
         self.cur = [0] * n
-        self.proj = torch.zeros((n, rows, width), dtype=torch.bfloat16, device=dev)
-        self.scratch_set = kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None
+        self.proj = sl.proj[slot]
+        self.scratch_set = sl.scratch[slot]
         self.scratch = self.scratch_set.views if n else []
-        self.latent = latent.ENABLED
-        if self.latent:              # one 512-wide latent a token and layer (kc), no separate values (vc)
-            self.kc = [torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
-            self.vc = [None for _ in dsa_layers]
-        else:
-            self.kc = [torch.zeros((capacity, HL, c.qk_dim), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
-            self.vc = [torch.zeros((capacity, HL, c.v_dim), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+        self.latent = self.caches.latent
         self.mtp_len = 0
         self.mtp_drafted = 0
-        if w.mtp is not None:
-            if self.latent:
-                self.mtp_kc = torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev)
-                self.mtp_vc = None
-            else:
-                self.mtp_kc = torch.zeros((capacity, HL, c.qk_dim), dtype=torch.bfloat16, device=dev)
-                self.mtp_vc = torch.zeros((capacity, HL, c.v_dim), dtype=torch.bfloat16, device=dev)
-        # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys
-        self.index = None
-        if w.meta.get("long_context"):
-            n_idx = len(dsa_layers) + (1 if w.mtp is not None else 0)
-            mk = lambda n: torch.zeros((n, c.index_dim), dtype=torch.bfloat16, device=dev)   # noqa: E731
-            self.index = [(mk(capacity), mk(capacity), mk(capacity // 4 + 2)) for _ in range(n_idx)]
+        if w.mtp is None:                        # views land in bind; mark absent otherwise
+            self.mtp_kc = self.mtp_vc = None
+        self.bind(base, capacity)
+
+    def bind(self, base: int, capacity: int) -> None:
+        """View the pool's tokens [base, base + capacity) (a new extent, grown or moved: the rows are the caller's)."""
+
+        self.base, self.capacity = int(base), int(capacity)
+        self.caches.bind(self, self.base, self.capacity)
+
+    @property
+    def graph_key(self) -> tuple[int, int]:
+        """What a captured graph baked in besides the shared buffers: the slot and the extent's base."""
+        return self.slot, self.base
 
     def reset(self) -> None:
         self.conv.zero_()
@@ -212,9 +301,11 @@ class State:
         return self.cur[0] if self.cur else 0
 
     def clone(self) -> "State":
+        """A copy with tensors of its own (no longer the pool's or the slot's views; not for captured graphs)."""
         import copy
 
         other = copy.copy(self)
+        other.proj = self.proj.clone()
         other.conv = self.conv.clone()
         other.rec = self.rec.clone()
         other.cur = list(self.cur)
@@ -224,7 +315,7 @@ class State:
         other.vc = [x.clone() if x is not None else None for x in self.vc]
         if self.index is not None:
             other.index = [tuple(x.clone() for x in trio) for trio in self.index]
-        if hasattr(self, "mtp_kc"):
+        if hasattr(self, "mtp_kc") and self.mtp_kc is not None:
             other.mtp_kc = self.mtp_kc.clone()
             other.mtp_vc = self.mtp_vc.clone() if self.mtp_vc is not None else None
         return other
@@ -416,14 +507,124 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         return gather(w, b, R)
 
 
+def _scratch_rows(s, lo: int):
+    """A prompt buffer's KDA scratch from row ``lo`` on (the same storage)."""
+
+    if lo == 0:
+        return s
+    from types import SimpleNamespace
+
+    return SimpleNamespace(out=s.out[lo:], k=s.k[lo:], v=s.v[lo:], g=s.g[lo:], b=s.b[lo:])
+
+
+def kda_front(layer: LayerW, b: Buffers, lo: int, hi: int) -> None:
+    """A prompt chunk's rows lo .. hi KDA input projections into the buffers (the row-independent part)."""
+
+    k = layer.kda
+    r = slice(lo, hi)
+    mm(b, b.normed[r], k.proj, b.xs[r], b.kproj[0, r])
+    fa = b.kproj[0, r, k.fa_off:k.fa_off + 128]
+    ga = b.kproj[0, r, k.ga_off:k.ga_off + 128]
+    mm(b, fa, k.fb, None if b.prefill else qmm.group_sums(fa, b.xs_fa[r]), b.ka[r])
+    mm(b, ga, k.gb, None if b.prefill else qmm.group_sums(ga, b.xs_ga[r]), b.kg[r])
+
+
+def kda_rows(layer: LayerW, w: Weights, st: State, b: Buffers, lo: int, n: int) -> torch.Tensor:
+    """A prompt chunk's KDA recurrence for rows lo .. lo + n of the prompt buffers (their projections done) on ``st``
+    from its position: the chain into b.kscratch.out[lo:lo + n] (returned), the layer's state committed and its conv
+    window shifted. ``kda_block`` runs a chunk as rows 0 .. R; a chunk of several streams' prompts
+    (``multi_prefill``) runs each stream's rows through this on that stream's state: the call they get alone."""
+
+    c = w.cfg
+    k = layer.kda
+    li = st.kda_index[layer.index]
+    rs = slice(lo, lo + n)
+    cur = st.cur[li]
+    with prof.timed("kda: recurrence"):
+        out = kda_mod.chain(b.kproj[0, rs], k.b_off, b.ka[rs], b.kg[rs], st.conv[li], k.conv, st.rec[cur, li],
+                            k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, _scratch_rows(b.kscratch, lo),
+                            st.rec[1 - cur, li])
+    st.cur[li] = 1 - cur
+    _shift_conv(st.conv[li:li + 1], b.kproj[:, rs], n)
+    return out
+
+
+def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+    """A prompt chunk's rows lo .. hi DSA projections, norms and query expansion into the buffers."""
+
+    c = w.cfg
+    a = layer.dsa
+    r = slice(lo, hi)
+    n = hi - lo
+    mm(b, b.normed[r], a.proj, b.xs[r], b.dp[r])
+    glue.rmsnorm(b.dp[r, :c.q_lora], a.q_norm, c.eps, b.qr[r], b.xs_qr[r])
+    glue.rmsnorm(b.dp[r, c.q_lora:], a.kv_norm, c.eps, b.lat[r], b.xs_lat[r])
+    mm(b, b.qr[r], a.q_b, b.xs_qr[r], b.q[r].view(n, a.heads * c.qk_dim))
+
+
+def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
+             index, host_pos: int | None, layer: int = -1, lo: int = 0) -> torch.Tensor:
+    """``_dsa_latent`` up to its output projection, for rows lo .. lo + R of the buffers (their front done) on one
+    stream's caches (``lc``, ``index``, ``pos_dev``, ``host_pos``: its first row's position): the latent write,
+    indexer update, absorb, attention and expand; returns the rows' attention output [R, heads * v_dim] (b.vn's rows).
+    A chunk of several streams' prompts (``multi_prefill``) runs each stream's rows through this: the call they get
+    alone. Requires the latent cache path (``a.absorb``)."""
+
+    c = w.cfg
+    HL = a.heads
+    s = b.lat_s
+    rs = slice(lo, lo + R)
+    with prof.timed("dsa: latent write"):
+        latent.latent_write(b.lat[rs], lc, pos_dev)
+    all_sparse = host_pos is not None and host_pos >= c.dense_limit
+    sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
+    if index is not None:
+        ik, ig, pk = index
+        ix = a.index
+        with prof.timed("dsa: indexer update"):
+            mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
+            glue.router(b.normed[rs], ix.gate, b.igr[rs])
+            sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+    with prof.timed("dsa: absorb"):
+        qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs])
+    ol = s.ol[rs]
+    scale = c.qk_dim ** -0.5
+    if not all_sparse:
+        with prof.timed("dsa: dense attention"):
+            dense_attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
+    if sparse_rows:
+        with prof.timed("dsa: select tokens"):
+            mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
+            tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
+                                                  pk.shape[0] - 2, pos_dev)
+        with prof.timed("dsa: sparse attention"):
+            latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+    with prof.timed("dsa: expand"):
+        return latent.expand_v(ol, a.absorb, b.vn[rs])
+
+
+def undone(R: int, done: tuple[int, int] | None) -> list[tuple[int, int]]:
+    """The row ranges of a chunk not already done: [(0, R)] unsplit, [(0, lo)] + [(hi, R)] around a middle span."""
+
+    if done is None:
+        return [(0, R)]
+    lo, hi = done
+    return ([(0, lo)] if lo else []) + ([(hi, R)] if hi < R else [])
+
+
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
-                  host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None) -> None:
+                  host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None,
+                  mixer=None) -> None:
+    """``mixer``: the layer's KDA / DSA block as ``mixer(layer)`` instead of on ``st`` (a multi-stream prompt chunk's
+    piecewise blocks, or a batched verify window's segmented blocks); everything else is the same calls."""
     c = w.cfg
     x = b.x[:R]
     h = layer.attn_hc
     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
-    if layer.kind == "kda":
+    if mixer is not None:
+        g = mixer(layer)
+    elif layer.kind == "kda":
         with prof.timed("kda"):
             g = kda_block(layer, w, st, b, R, cut)
     else:
@@ -464,16 +665,16 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
     return R
 
 
-def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
-            host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None):
-    """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention."""
+def compute(w: Weights, st: State | None, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
+            host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None, mixer=None):
+    """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention. ``mixer``: the layers' KDA / DSA blocks as ``mixer(layer)`` (multi-stream windows), with ``st`` None allowed."""
 
     if cut is not None and (not b.prefill or not 0 < cut.point < R):
         raise ValueError("a prompt cut must lie inside a prefill chunk")
     c = w.cfg
     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
     for layer in w.layers:
-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cut)
+        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, cut, mixer)
         for slot in b.tap_at.get(layer.index, ()):
             glue.stream_mean(b.x[:R], b.taps[slot][:R])
     glue.stream_mean(b.x[:R], b.hidden[:R])

@@ -39,11 +39,11 @@ from typing import Any, Callable, Sequence
 import numpy as np
 import torch
 
+from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.scheduler import Scheduler
 from tensorfold.cuda.streams import Stream, next_fill
 
 from . import multi_prefill
-from .copy_drafts import CopyDrafts
 from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
 from .pool import ALIGN, Pool, align_up
 from .verify import BatchedVerify, Segment, SerialVerify, Verified
@@ -128,16 +128,21 @@ def fill_share(value: str | None = None) -> float:
     return share
 
 
-def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[int]:
-    """A request's policy code under --parallel: serial stays serial; auto becomes TF_GLM_DFLASH_POLICY; an MTP
-    policy its DFlash2 twin; without a draft model, serial."""
+def multi_code(code: list[int], dflash: bool, mtp: bool, dflash_policy: list[int]) -> list[int]:
+    """A request's policy code under --parallel: serial stays serial; auto becomes TF_GLM_DFLASH_POLICY with a draft
+    model, else an adaptive MTP policy (the single-stream sampled auto's) when the MTP head is loaded; without
+    either, serial. Given MTP policies (kinds 1-3) stay MTP: the multi-stream engine drafts them on the MTP head."""
 
     kind = code[0]
-    if kind == 0 or not dflash:
+    if kind == 0:
         return [0, 0, 0, 0]
     if kind in (4, 5):
-        return list(dflash_policy)
-    return [kind + 10] + list(code[1:]) if kind < 10 else list(code)
+        if dflash:
+            return list(dflash_policy)
+        return [2, 3, 600000, 850000] if mtp else [0, 0, 0, 0]
+    if kind < 10:                          # MTP: keep the request's own chain rule
+        return list(code) if mtp else ([0, 0, 0, 0] if not dflash else [kind + 10] + list(code[1:]))
+    return list(code) if dflash else [0, 0, 0, 0]
 
 
 def trim(drafts: list[list[int]], cap: int = MAX_WINDOW) -> list[list[int]]:
@@ -310,10 +315,7 @@ class Lane:
     copy_rounds: int = 0
     copy_drafted: int = 0
     copy_accepted: int = 0
-
-
-class NoRoom(RuntimeError):
-    """The pool cannot place a stream now (it waits for others to finish)."""
+    head: Any = None                   # a replay's kept head row (unused under --parallel here)
 
 
 class MultiDecoder:
@@ -359,11 +361,17 @@ class MultiDecoder:
                 self.drafts.capture()
         if verify is None:
             if verify_kind() == "batched":
-                taps = engine.drafter.tap_layers if engine.drafter is not None else ()
-                verify = BatchedVerify(e, taps=taps, rows=MAX_WINDOW)
-                # TF_GLM_MULTI_GRAPHS=0: eager windows (the same bits); by default a graph a window size
-                if os.environ.get("TF_GLM_MULTI_GRAPHS", "1") != "0" and torch.cuda.is_available():
-                    verify.capture()
+                try:
+                    taps = engine.drafter.tap_layers if engine.drafter is not None else ()
+                    verify = BatchedVerify(e, taps=taps, rows=MAX_WINDOW)
+                    # TF_GLM_MULTI_GRAPHS=0: eager windows (the same bits); by default a graph a window size
+                    if os.environ.get("TF_GLM_MULTI_GRAPHS", "1") != "0" and torch.cuda.is_available():
+                        verify.capture()
+                except (ImportError, AttributeError, ValueError) as exc:
+                    if self.rank == 0:
+                        print(f"[tensorfold] TF_GLM_MULTI_VERIFY=batched needs the segmented kernels "
+                              f"({exc}); windows run serially instead (the same bits)", flush=True)
+                    verify = SerialVerify(e, taps=self.drafts is not None)
             else:
                 verify = SerialVerify(e, taps=self.drafts is not None)
         self.verify = verify
@@ -378,7 +386,7 @@ class MultiDecoder:
         graphs = getattr(e, "graphs", None)
         self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=0)
         self.row_ms = list(row_ms) if row_ms is not None else None
-        if self.tune.depth == "joint" and self.row_ms is None:
+        if self.tune.depth == "joint" and self.row_ms is None and isinstance(self.verify, BatchedVerify):
             self.row_ms = self._time_rows()
         # both ranks: the comparison replays graphs whose all-gathers the other rank must join (TF_GLM_MULTI_PROFILE
         # is in the two-rank settings comparison, so both run it or neither)
@@ -545,9 +553,6 @@ class MultiDecoder:
         """Rank 0: place a request (slot, extent; resumed from the longest kept prefix of its prompt when it drafts)
         and queue its ADMIT; its prompt is prefilled chunk by chunk in later iterations."""
 
-        from .engine import grid_point, shared_points
-        from .engine import VisionFeed
-
         self._check()
         g = self.g
         prompt = [int(t) for t in s.prompt]
@@ -560,28 +565,17 @@ class MultiDecoder:
             raise ValueError(f"a prompt of {len(prompt)} tokens does not fit the {self.pool.rows}-token pool")
         info = getattr(s, "glm", None) or {}
         draft = bool(s.draft) and not g.serial_only
-        code = multi_code(info.get("code") or [0, 0, 0, 0], self.drafts is not None and draft,
+        code = multi_code(info.get("code") or [0, 0, 0, 0], self.drafts is not None and draft, g.mtp_on,
                           self.dflash_code) if draft else [0, 0, 0, 0]
         positions: list[int] = []
         feed = None
-        if s.vision is not None:              # encoded before anything is decided or sent: a failure stops here
-            if g.vision is None:
-                raise ValueError("image inputs require starting this server with --vision")
-            positions = [int(p) for p in s.vision.positions]
-            if positions and (positions[-1] >= len(prompt) or positions != sorted(set(positions))):
-                raise ValueError("image rows must sit at increasing positions inside the prompt")
-            t = time.perf_counter()
-            torch.cuda.empty_cache()
-            rows = g.vision.features(s.vision)
-            torch.cuda.empty_cache()
-            if rows.shape[0] != len(positions):
-                raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
-            feed = VisionFeed(g, positions, rows)
-            feed.encode_s = time.perf_counter() - t
+        if s.vision is not None:
+            raise ValueError("image inputs are not supported under --parallel")
         slot = next((k for k in range(self.count) if k not in {l.slot for l in self.lanes.values()}), None)
         if slot is None:
             raise NoRoom(f"every one of the {self.count} stream slots is taken")
-        hit = self._resume(prompt) if draft and feed is None else None
+        # MTP lanes do not resume from kept prompts yet (no MTP caches kept between conversations)
+        hit = self._resume(prompt) if draft and code[0] >= 10 else None
         need = self._need(len(prompt))
         # placement: take a kept extent over in place, or copy its rows into a new one while a stream writes in it
         copy = 0
@@ -605,10 +599,6 @@ class MultiDecoder:
             copy = int(hit is not None)
         cut = len(hit.ids) if hit is not None else 0
         shared: list[int] = []
-        if draft and feed is None and g.shared:
-            known = [np.asarray(c.ids, dtype=np.int64) for c in self.kept]
-            shared = shared_points(prompt, cut, grid_point(len(prompt), cut, self.grid), self.grid, g.shared, known,
-                                   g.opener)
         sid = self.next_sid
         payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
                    int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
@@ -647,7 +637,7 @@ class MultiDecoder:
     def _admitted(self, a: dict, s: Stream, feed, constraint, spec: str = "") -> None:
         """Both ranks: an ADMIT's stream in its slot and extent, resumed from its kept prompt if it names one."""
 
-        from .engine import decode_policy, grid_point
+        from .engine import decode_policy
         from .forward import State
 
         g, e = self.g, self.e
@@ -670,11 +660,10 @@ class MultiDecoder:
         st = State(self.w, x.size, e.rows, caches=e.caches, base=x.base, slots=e.slots, slot=a["slot"])
         code = a["code"]
         dflash = code[0] >= 10 and self.drafts is not None
-        policy = decode_policy(code, g.costs) if code[0] else None
+        policy = decode_policy(code) if code[0] else None
         lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
                     constraint=constraint)
-        if not dflash and policy is not None and g.mtp_on:
-            lane.mtp = True
+        lane.mtp = bool(a["draft"]) and not dflash and policy is not None and g.mtp_on
         self.next_sid = max(self.next_sid, a["sid"] + 1)
         self.next_order += 1
         s.sid, s.cached = a["sid"], cut
@@ -691,12 +680,6 @@ class MultiDecoder:
                     raise RuntimeError("a kept prompt without DFlash2's window was chosen for a DFlash2 stream")
                 put_draft_window(self._ctx(lane), cut, hit.drafter_rows)
             self._touch(hit)
-        # where its prompt states are kept: the grid point (or the end) and rank 0's shared-prefix points
-        if a["draft"] and feed is None:
-            lane.point = grid_point(len(prompt), cut, self.grid)
-            lane.shared = sorted(p for p in set(a["shared"]) if lane.point is not None and cut < p < lane.point)
-            lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None and lane.point < len(prompt)
-                                              else [])
         s.started = time.perf_counter()
         lane.t0 = s.started
         self.lanes[lane.sid] = lane
@@ -725,14 +708,14 @@ class MultiDecoder:
     def _touch(self, c) -> None:
         self.kept = [k for k in self.kept if k is not c] + [c]
 
-    def _keep(self, lane: Lane, n: int, head: torch.Tensor | None = None) -> None:
+    def _keep(self, lane: Lane, n: int) -> None:
         """Both ranks: the lane's state at prompt position n (== its pos) becomes a kept prompt in its extent."""
 
         from .decode import take_snapshot
 
         prev = self.e.use(lane.st)
         try:
-            snap = take_snapshot(self.e, lane.s.prompt[:n], head, mtp=getattr(lane, 'mtp', False), drafter=None)
+            snap = take_snapshot(self.e, lane.s.prompt[:n], None, mtp=lane.mtp, drafter=None)
         finally:
             self.e.use(prev)
         snap.drafter_end = -1
@@ -1057,7 +1040,7 @@ class MultiDecoder:
                     self._keep(lane, stop)
                 return None
             if lane.point == n:
-                self._keep(lane, n, head=out[:1].clone())
+                self._keep(lane, n)
             logits = out[:1]
             if lane.constraint is not None:             # the first token's row, under the reply's grammar
                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
@@ -1111,18 +1094,21 @@ class MultiDecoder:
             if not start < stop <= n or stop - start > e.prefill_rows:
                 raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
             pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
-                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n, mtp=lane.mtp))
+                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n,
+                                              mtp=lane.mtp, nxt=list(lane.s.prompt[start + 1:stop + 1])))
         t = time.perf_counter()
         heads = multi_prefill.prefill_pieces(e, pieces)
         parts, who = [], []
-        for k, ((lane, stop), out) in enumerate(zip(group, heads)):
+        for k, ((lane, stop), piece, out) in enumerate(zip(group, pieces, heads)):
             n = len(lane.s.prompt)
             if stop < n:
                 if stop in lane.stops:
                     self._keep(lane, stop)
                 continue
             if lane.point == n:
-                self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
+                self._keep(lane, n)
+            if lane.mtp:                        # the prompt's last row's hidden: the MTP's first draft reads it
+                lane.last_hidden = piece.last_hidden
             logits = out[:1]
             if lane.constraint is not None:             # the first token's row, under the reply's grammar
                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
@@ -1145,50 +1131,85 @@ class MultiDecoder:
     @torch.no_grad()
     def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False) -> None:
         """Both ranks: one decode round over ``lanes`` (``depths``: rank 0's, checked on rank 1); ``lone``: one
-        stream at home, verified through the one-stream graphs when its window fits them."""
+        stream at home, verified through the one-stream graphs when its window fits them.
 
-        from .decode import copy_room
+        MTP lanes run first, each through the exact serial pipeline (its own window on its own state, ``e.forward``)
+        so its reply is bit-for-bit ``mtp_decode``'s; DFlash2 lanes share one verify window (``forward_streams``)."""
+
         from .dflash2_multi import DraftRequest
 
         if depths is not None and [l.depth for l in lanes] != depths:
             raise RuntimeError(f"rank {self.rank}'s draft depths {[l.depth for l in lanes]} are not rank 0's {depths}")
         prof = self.profile
         tune = self.tune
+        mtp_lanes = [l for l in lanes if l.mtp]
+        vlanes = [l for l in lanes if not l.mtp]
         drafts: list[list[int]] = []
         copied: list[bool] = []
         asks = []
-        lengths: list[int] = []
-        for l in lanes:
-            c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None else []
+        for l in vlanes:
+            c = l.copies.propose(min(l.s.count - len(l.s.out) - 1, l.copies.most)) if l.copies is not None else []
             copied.append(bool(c))
             drafts.append(list(c))
-            lengths.append(len(c))
-            if not c and getattr(l, 'mtp', False) and l.depth > 0:
-                from .decode import draft
-                prev = self.e.use(l.st)
-                try:
-                    d = draft(self.e, l.last_hidden, l.pending_tokens, l.st.pos + 1, l.depth, l.s.sampling, l.policy.confidence)
-                    lengths[-1] = len(d)
-                    drafts[-1] = list(d)
-                finally:
-                    self.e.use(prev)
-            elif not c and l.dflash and l.depth > 0:
+            if not c and l.dflash and l.depth > 0:
                 conf = l.policy.confidence
                 if tune.depth == "scale":
                     conf = scaled_confidence(conf, len(lanes), tune.alpha)
-                asks.append((len(drafts) - 1, DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling,
-                                                           conf, **l.policy.chain_rule)))
+                asks.append((len(drafts) - 1, DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling, conf)))
         if asks and tune.depth == "joint":
-            self._joint(lanes, drafts, asks)
+            self._joint(vlanes, drafts, asks)
         elif asks:
             got = self.drafts.propose([a for _, a in asks])
             for (k, _), d in zip(asks, got):
                 drafts[k] = list(d)
-        drafts = trim(drafts, MAX_WINDOW)
         if prof is not None:
             prof.mark("propose")
+        # -- MTP lanes: the serial mtp_decode chain per lane on its own state --------------------------------
+        for l in mtp_lanes:
+            from .decode import commit as _commit
+            from .decode import draft as mtp_draft
+
+            e = self.e
+            prev = e.use(l.st)
+            try:
+                d = (mtp_draft(e, l.last_hidden, l.pending_tokens, l.st.pos + 1, l.depth, l.s.sampling,
+                               l.policy.confidence) if l.depth > 0 else [])
+                tokens = [l.s.out[-1]] + d
+                l.window = None
+                if l.constraint is not None:            # the chain cut at its first draft the grammar rejects
+                    l.window = l.constraint.window(tokens, list(range(-1, len(tokens) - 1)))
+                    tokens = list(l.window.tokens)
+                R = len(tokens)
+                logits = e.forward(tokens)              # the graphs' when home (``lone``), eager elsewhere
+                if l.window is not None:
+                    l.constraint.mask(logits, l.window, self.w.vocab_offset)
+                rows = e.sample(logits[:R], [l.st.pos + 1 + r for r in range(R)], l.s.sampling)
+                keep = 1
+                for i, x in enumerate(tokens[1:]):
+                    if rows[i] != x or (l.s.stop_eos and rows[i] in self.eos):
+                        break
+                    keep += 1
+                _commit(e.w, l.st, e.buf, R, keep)
+                new = rows[:keep]
+                if l.constraint is not None:
+                    l.constraint.advance(new)
+                l.last_hidden = e.main_hidden(slice(0, keep)).clone()
+                l.pending_tokens = list(new)
+                ndrafts = len(tokens) - 1
+                s = l.s
+                s.counted(len(tokens))
+                room = s.count - len(s.out)
+                s.take(new[:max(0, room)], self._ends(l))
+                if l.policy is not None:
+                    l.depth = min(l.policy.next(ndrafts, keep - 1), max(0, s.count - len(s.out)))
+            finally:
+                e.use(prev)
+        # -- DFlash2 lanes: one verify window over every segment -----------------------------------------------
+        if not vlanes:
+            return
+        drafts = trim(drafts, MAX_WINDOW)
         segments = []
-        for l, d in zip(lanes, drafts):
+        for l, d in zip(vlanes, drafts):
             tokens = [l.s.out[-1]] + d
             l.window = None
             if l.constraint is not None:                # the chain cut at its first draft the grammar rejects
@@ -1208,7 +1229,7 @@ class MultiDecoder:
             prof.gpu_stop()
             prof.mark("verify")
         parts = []
-        for l, seg, logits in zip(lanes, segments, v.logits):
+        for l, seg, logits in zip(vlanes, segments, v.logits):
             if l.window is not None:
                 l.constraint.mask(logits, l.window, self.w.vocab_offset)
             parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
@@ -1216,7 +1237,7 @@ class MultiDecoder:
         if prof is not None:
             prof.mark("sample")
         keeps = []
-        for l, seg, rows in zip(lanes, segments, sampled):
+        for l, seg, rows in zip(vlanes, segments, sampled):
             keep = 1
             for i, d in enumerate(seg.tokens[1:]):
                 if rows[i] != d or (l.s.stop_eos and rows[i] in self.eos):
@@ -1229,20 +1250,12 @@ class MultiDecoder:
         if prof is not None:
             prof.mark("commit")
         if self.drafts is not None:
-            items = [(self._ctx(l), v.taps[k][:keep]) for k, (l, keep) in enumerate(zip(lanes, keeps)) if l.dflash]
+            items = [(self._ctx(l), v.taps[k][:keep]) for k, (l, keep) in enumerate(zip(vlanes, keeps)) if l.dflash]
             if items:
                 self.drafts.commit(items)
-        for l, seg, rows, keep in zip(lanes, segments, sampled, keeps):
-            if getattr(l, 'mtp', False):
-                prev = self.e.use(l.st)
-                try:
-                    l.last_hidden = self.e.main_hidden(slice(0, keep))
-                    l.pending_tokens = rows[:keep]
-                finally:
-                    self.e.use(prev)
         if prof is not None:
             prof.mark("taps")
-        for l, seg, rows, keep, was_copy in zip(lanes, segments, sampled, keeps, copied):
+        for l, seg, rows, keep, was_copy in zip(vlanes, segments, sampled, keeps, copied):
             s = l.s
             new = rows[:keep]
             if l.constraint is not None:
@@ -1389,10 +1402,7 @@ class MultiDecoder:
                     s.constraint = constraint
                 feed = None
                 if a["positions"]:
-                    from .engine import VisionFeed
-
-                    feed = VisionFeed(self.g, list(a["positions"]), None)
-                    s.vision = feed
+                    raise RuntimeError("rank 1: image prompts are not supported under --parallel")
                 self._admitted(a, s, feed, constraint)
             elif op == EVICT:
                 self._drop(self._kept_by_id(p[0]))

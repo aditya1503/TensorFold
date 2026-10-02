@@ -148,7 +148,7 @@ def sample_packed(w, parts: Sequence[tuple]) -> list[list[int]]:
     ``NUCLEUS`` best (value, id, mass), its shard's mass and width. Row by row the arithmetic is ``nucleus_rows``' and
     ``sample_rows``'; a nucleus part some row of which runs past the candidates reads whole shards on its own."""
 
-    from tensorfold.cuda.sampling import MASS, NUCLEUS, WIDER, _draw, _shares, comm_gather, one_rank, union_cover
+    from tensorfold.cuda.sampling import MASS, NUCLEUS, _draw, _shares, comm_gather, one_rank
     from tensorfold.engine.exact_sampling import MARGIN, choose_rows
 
     gather = one_rank if w.comm is None else comm_gather(w.comm)
@@ -223,8 +223,6 @@ def sample_packed(w, parts: Sequence[tuple]) -> list[list[int]]:
             _, positions, sampling = parts[k]
             drawn = _draw(got, positions, sampling)
             m_k = mass[r0:r0 + R]
-            if drawn is None and union_cover() and int(got[4].max()) > WIDER:     # as nucleus_rows: wider first
-                drawn = _draw(_shares(gather, scaled_k, m_k, WIDER, int(w.vocab_offset), None), positions, sampling)
             if drawn is None:              # a row's nucleus runs past the candidates: this part reads whole shards
                 drawn = _draw(_shares(gather, scaled_k, m_k, int(got[4].max()), int(w.vocab_offset), None),
                               positions, sampling)

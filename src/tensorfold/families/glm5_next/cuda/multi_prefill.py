@@ -67,14 +67,18 @@ def wait_ms(value: str | None = None) -> float:
 @dataclass(eq=False)
 class Piece:
     """A stream's rows of a multi-prompt chunk: ``tokens`` its prompt from ``st.pos`` on; ``drafter`` its DFlash2
-    context (taps added after the forward) or None; ``head``: the piece ends its prompt (its last row's logits)."""
+    context (taps added after the forward) or None; ``head``: the piece ends its prompt (its last row's logits);
+    ``mtp``: its rows also feed its MTP head (the pairings ``nxt``, one token ahead); its last row's hidden is copied
+    out as ``last_hidden`` for the MTP's first draft."""
 
     st: Any
     tokens: list[int]
     drafter: Any = None
     head: bool = False
     mtp: bool = False
+    nxt: list[int] | None = None
     lo: int = field(default=0, init=False)       # its first row in the chunk
+    last_hidden: Any = field(default=None, init=False)
 
     @property
     def rows(self) -> int:
@@ -176,6 +180,8 @@ def prefill_pieces(e, pieces: Sequence[Piece]) -> list[torch.Tensor | None]:
         if p.head:                       # the head on the piece's last row: the one-row matmul a chunk of its own runs
             r = p.lo + p.rows - 1
             heads.append(mm(b, b.fnormed[r:r + 1], w.head, b.fxs[r:r + 1], b.logits[:1]).clone())
+            if p.mtp:                    # the MTP's first draft reads this row's hidden: copy before the absorbs
+                p.last_hidden = b.fnormed[r:r + 1].clone()
         else:
             heads.append(None)
     for p in pieces:
@@ -183,13 +189,17 @@ def prefill_pieces(e, pieces: Sequence[Piece]) -> list[torch.Tensor | None]:
             p.drafter.add_taps(torch.cat([t[p.lo:p.lo + p.rows] for t in b.taps], dim=1))
     for p in pieces:
         if p.mtp:
-            from .engine import _absorb_rows
-            # For MTP, we need to absorb the fnormed rows against the shifted tokens.
-            # p.tokens are prompt[start:stop]. We need prompt[start+1:stop+1].
-            # The piece holds st, we can access p.st.prompt to get the next tokens.
-            nxt = p.st.prompt[p.st.pos + 1 : p.st.pos + p.rows + 1]
-            if len(nxt) > 0:
-                _absorb_rows(e, b.fnormed[p.lo : p.lo + len(nxt)], nxt)
+            from .decode import _absorb_rows
+
+            # the MTP cache's prompt pairings: each row's hidden with the next prompt token (across the piece's end
+            # into the prompt's next row when there is one, as every chunk of its own absorbs)
+            nxt = list(p.nxt if p.nxt is not None else p.tokens[1:])
+            if nxt:
+                prev = e.use(p.st)
+                try:
+                    _absorb_rows(e, b.fnormed[p.lo:p.lo + len(nxt)], nxt)
+                finally:
+                    e.use(prev)
     for p in pieces:
         commit(w, p.st, b, p.rows, p.rows)
     return heads
