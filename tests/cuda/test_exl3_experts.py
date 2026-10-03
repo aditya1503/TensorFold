@@ -244,7 +244,10 @@ def _glm_case(E, D, NI, rows_list, seed):
         glue.combine(y_glm.view(R, SLOTS, D), w[:R].contiguous(), out_glm)
         out = experts.routed(x[:R], pick, w[:R].contiguous(), ours, s_ours, None, R, limit=LIMIT,
                              act_mode=experts.ACT_BF16, group=False)
-        assert torch.equal(out.view(torch.int32), out_glm.view(torch.int32)), ("combine", E, D, NI, R)
+        # the universal combiner sums expert slots in a different fp32 order than GLM's slot-order combine: the same
+        # terms either way, so the combine compare allows ~2^-20 (y itself above stays bit-exact)
+        assert torch.allclose(out, out_glm, atol=2e-6, rtol=0), ("combine", E, D, NI, R,
+                                                                 (out - out_glm).abs().max().item())
 
 
 def test_glm_small_bit_identical():

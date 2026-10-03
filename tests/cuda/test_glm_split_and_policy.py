@@ -176,7 +176,9 @@ def test_policies_and_the_request_header():
     assert encode_policy("auto") == [4, 2, 8, 30000] and encode_policy("auto:1:2:0.05") == [5, 1, 2, 50000]
     assert decode_policy(encode_policy("auto")) == ("auto", 2, 8, 0.03, False)
     assert decode_policy(encode_policy("auto:1:2:0.05")) == ("auto", 1, 2, 0.05, True)
-    for bad in ("", "x", "c3", "c9:0.3", "9", "-1", "a:0.6", "ab", "auto:1", "auto:0:1:0.1", "auto:1:1:1.5"):
+    # wider verify windows (TF_GLM_WIDE_GRAPHS) make c9 and 9 valid depths, clamped by the policy
+    assert encode_policy("c9:0.3") == [3, 9, 300000, 0] and encode_policy("9") == [1, 9, 0, 0]
+    for bad in ("", "x", "c3", "-1", "a:0.6", "ab", "auto:1", "auto:0:1:0.1", "auto:1:1:1.5"):
         with pytest.raises(ValueError):
             encode_policy(bad)
     assert decode_policy(encode_policy("0")) is None
