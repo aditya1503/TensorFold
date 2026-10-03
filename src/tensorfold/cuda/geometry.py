@@ -363,15 +363,31 @@ def draft_geometry(t: dict, world: int, reserve: int, *, bounded: bool = False, 
     return Geometry(bytes_at, reserve)
 
 
-def dflash2_geometry(t: dict, world: int, reserve: int, *, ring: bool) -> Geometry:
-    """GLM's DFlash2 drafter on each rank: one context (a ring, or capacity + block rows) and a block pass."""
+def draft_backbone(t: dict) -> dict:
+    """A drafter config's backbone fields: incoai's DFlash2 keeps them flat, a speculators one nests them."""
 
-    layers = int(t["num_hidden_layers"])
-    heads = int(t["num_key_value_heads"]) // world
-    hd = int(t["head_dim"])
-    block = int((t.get("dflash_config") or {}).get("block_size", 16))
-    window = int(t.get("sliding_window", 0))
-    fixed = 16 * max(64, block) * (int(t["hidden_size"]) + int(t["intermediate_size"])) * 4
+    return t.get("transformer_layer_config") or t
+
+
+def draft_block_size(t: dict) -> int:
+    """A drafter's block: DFlash2 nests it in ``dflash_config``, a speculators DSpark keeps it top level."""
+
+    if "dflash_config" in t:
+        return int(t["dflash_config"].get("block_size", 16))
+    return int(t.get("block_size", 16))
+
+
+def dflash2_geometry(t: dict, world: int, reserve: int, *, ring: bool) -> Geometry:
+    """GLM's block drafter (DFlash2 or DSpark) on each rank: one context (a ring, or capacity + block rows) and a
+    block pass."""
+
+    b = draft_backbone(t)
+    layers = int(b["num_hidden_layers"])
+    heads = int(b["num_key_value_heads"]) // world
+    hd = int(b["head_dim"])
+    block = draft_block_size(t)
+    window = int(b.get("sliding_window", 0))
+    fixed = 16 * max(64, block) * (int(b["hidden_size"]) + int(b["intermediate_size"])) * 4
     rows = draft_ring_rows(window - 1, block) if ring and window > 0 else 0
 
     def bytes_at(capacity: int) -> int:
@@ -381,10 +397,12 @@ def dflash2_geometry(t: dict, world: int, reserve: int, *, ring: bool) -> Geomet
 
 
 def dflash2_weights(draft_dir, world: int) -> Weights:
-    """GLM's DFlash2 drafter as held on each rank (4-bit copies, bf16 norms, fp32 codebooks), and its staging."""
+    """GLM's block drafter (DFlash2 or a speculators DSpark) as held on each rank (4-bit copies, bf16 norms, fp32
+    codebooks or Markov tables), and its staging."""
 
     h = headers(draft_dir)
     shape = {name: [int(x) for x in info["shape"]] for name, info in h.items()}
+    conv = any(name.endswith("attention_conv.kernel_projection.weight") for name in shape)
 
     def q4(n: int, k: int) -> int:
         return -(-n // 128) * 128 * k * 9 // 16
@@ -402,14 +420,20 @@ def dflash2_weights(draft_dir, world: int) -> Weights:
         quantized |= {p + x for x in ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
                                       "self_attn.o_proj.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight",
                                       "mlp.down_proj.weight")}
-        for conv in ("attention_conv", "mlp_conv"):
-            name = p + conv + ".kernel_projection.weight"
-            mats.append(tuple(shape[name]))
-            quantized.add(name)
+        if conv:
+            for name in (p + "attention_conv.kernel_projection.weight", p + "mlp_conv.kernel_projection.weight"):
+                mats.append(tuple(shape[name]))
+                quantized.add(name)
     resident = sum(q4(n, k) for n, k in mats)
     for name, dims in shape.items():
-        if name not in quantized:
-            resident += math.prod(dims) * (4 if name.endswith("_codebook") else 2)
+        if name in quantized:
+            continue
+        if not conv and name in ("embed_tokens.weight", "lm_head.weight"):
+            continue      # a speculators DSpark repeats the verifier's embedding and head; the port uses the target's
+        resident += math.prod(dims) * (4 if name.endswith("_codebook") else 2)
+    if not conv:           # the Markov tables ride on the host as fp32, like the codebooks (bf16 above)
+        for name in ("markov_head.markov_w1.weight", "markov_head.markov_w2.weight"):
+            resident += math.prod(shape[name]) * 2
     staging = max(4 * n * k + 24 * min(n, 8192) * k for n, k in mats)
     return Weights(resident, staging, 0)
 

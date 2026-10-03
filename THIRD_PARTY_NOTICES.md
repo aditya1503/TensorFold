@@ -88,8 +88,10 @@ The MTP layer TensorFold drafts with comes from that checkpoint's last shard (MI
 `families/deepseek_v4/convert.py`.
 
 TensorFold ships no model weights. The `z-lab/Qwen3.8-27B-DFlash2` model card states Apache-2.0.
-The optional `incoai/GLM-5.3-Flash-DFlash2` model card states CC BY-NC-ND 4.0, for non-commercial use
-without derivatives. Each checkpoint keeps its own license.
+The `RedHatAI/GLM-5.3-Flash-speculator.dspark-preview` model card states MIT, and its base model
+(zai-org/GLM-5.3-Flash) is MIT as well. The optional `incoai/GLM-5.3-Flash-DFlash2` model card states
+CC BY-NC-ND 4.0, for non-commercial use without derivatives; it still loads when passed with `--drafter`.
+Each checkpoint keeps its own license.
 
 ## MIT License text
 

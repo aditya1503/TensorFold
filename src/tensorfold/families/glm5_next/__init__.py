@@ -10,7 +10,9 @@ TITLE = "GLM-5.3-Flash"
 LANES = True
 # 4-bit weights in groups of 64 with the MTP layer kept; the EXL3 checkpoint is the CUDA engine's alone
 MODELS = ("Vontra/GLM-5.3-Flash-MLX-4bit-MTP", "Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw")
-DRAFTER = "incoai/GLM-5.3-Flash-DFlash2"   # the CUDA engine's optional draft model; the Mac engine drafts with MTP
+# the CUDA engine's optional draft model — RedHatAI's DSpark drafter (MIT, speculators format; the incoai DFlash2
+# checkpoint it replaced is CC BY-NC-ND 4.0, and still loads when passed with --drafter); the Mac engine drafts with MTP
+DRAFTER = "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"
 KERNEL_PACKAGE = "tensorfold.kernels.glm.flash.v1"
 # the prompt experts' sorted gather (Flash Next's prompt matmuls), hashed into snapshot keys
 KERNEL_DEPENDENCIES = ("tensorfold.kernels.qwen.flash_next.v1.prefill_mm",)

@@ -353,9 +353,9 @@ class MultiDecoder:
         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
         self.drafts = drafts
         if self.drafts is None and engine.drafter is not None:
-            from .dflash2_multi import MultiDrafter
+            from .dspark import make_multi
 
-            self.drafts = MultiDrafter(engine.drafter, streams=streams)
+            self.drafts = make_multi(engine.drafter, streams=streams)
             graphs = os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0" if draft_graphs is None else draft_graphs
             if graphs and torch.cuda.is_available():
                 self.drafts.capture()

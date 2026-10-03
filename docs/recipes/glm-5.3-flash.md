@@ -22,17 +22,20 @@ tensorfold serve TensorFold/GLM-5.3-Flash-MLX-4bit-MTP --tp 2 --rank 0 --master 
 ```
 
 Rank 1 starts first and rank 0 serves HTTP. Use the same context and drafting settings on both ranks.
-The optional `incoai/GLM-5.3-Flash-DFlash2` model has CC BY-NC-ND 4.0 terms; pull it on both ranks only
-when those terms fit the intended use. The CLI uses it automatically once it has been pulled.
-Without it, the engine uses MTP drafts; `--drafter none` explicitly selects MTP-only drafting.
+The optional draft model is RedHatAI's DSpark preview (`RedHatAI/GLM-5.3-Flash-speculator.dspark-preview`, MIT):
+a 5-layer block drafter with a Markov logit-bias head and a confidence head, drafting up to 8 tokens a round
+with the anchor row included. The CLI uses it automatically once it has been pulled, on both ranks.
+Without it, the engine uses MTP drafts; `--drafter none` explicitly selects MTP-only drafting, and the incoai
+`GLM-5.3-Flash-DFlash2` checkpoint (CC BY-NC-ND 4.0 terms) still loads when passed with `--drafter` on both ranks.
 Give both ranks the same drafter setting. `--no-drafts` disables all drafting for the serial reference.
-A checkpoint with neither an MTP head nor a supplied DFlash2 model is refused unless drafts are disabled.
-`TF_GLM_MTP` decides whether the CUDA engine loads the MTP head: `1` (the default) keeps it beside DFlash2, so MTP
-policies and `auto`'s per-round choice stay available; `auto` leaves it out when DFlash2 is loaded or drafts are
-disabled; `0` leaves it out. Left out, it saves each rank the head's weights (about 2 GiB for this checkpoint), its
-cache rows and decode buffers, and prompts skip its absorb; MTP policies (and `--mtp-drafts N`) then draft with
-DFlash2. Replies are the same either way. On two GB10s with DFlash2, `auto` read prompts about 3% faster and decoded
-sampled code faster, but greedy chat about 4% slower, so the head stays by default. Give both ranks the same setting.
+A checkpoint with neither an MTP head nor a supplied draft model is refused unless drafts are disabled.
+`TF_GLM_MTP` decides whether the CUDA engine loads the MTP head: `1` (the default) keeps it beside the block
+drafter, so MTP policies and `auto`'s per-round choice stay available; `auto` leaves it out when a draft model is
+loaded or drafts are disabled; `0` leaves it out. Left out, it saves each rank the head's weights (about 2 GiB for
+this checkpoint), its cache rows and decode buffers, and prompts skip its absorb; MTP policies (and `--mtp-drafts
+N`) then draft with DSpark (or DFlash2 when it was passed). Replies are the same either way. On two GB10s with a
+block drafter, `auto` read prompts about 3% faster and decoded sampled code faster, but greedy chat about 4%
+slower, so the head stays by default. Give both ranks the same setting.
 
 ### EXL3
 
@@ -47,16 +50,38 @@ The expert decoder and BF16 target matmul keep row arithmetic fixed. A quantized
 propose drafts, but target verification retains the BF16 head. EXL3 speed, capacity and long-context
 qualification are TBD [release-0.3.5].
 
+### The DSpark draft model's weight test
+
+`RedHatAI/GLM-5.3-Flash-speculator.dspark-preview` is the default drafter pin; these are the GPU-only checks
+beyond `tests/test_glm_dspark_drafter.py`, on both ranks:
+
+```bash
+tensorfold pull RedHatAI/GLM-5.3-Flash-speculator.dspark-preview        # both ranks; MIT
+pytest tests/cuda/test_glm_engine.py -q                                  # the engine suite, DSpark under it
+pytest tests/cuda/test_glm_mtp_parallel.py -q                            # --parallel, the multi-stream pool
+```
+
+What to watch, in order: the startup lines name `DSpark` for the drafter and its taps read 6 target layers
+(`drafter costs (ms): ... DSpark block ...`); a round's drafts run to 8 tokens with the anchor row drafting
+first (`sample_from_anchor`), unlike DFlash2's block minus one; the per-round choice between MTP (`m`) and DSpark
+(`f`) appears in `/health`'s arm string; and replies still equal one-token decoding at temperature 0 — drafts only
+propose. Under `--parallel 2`+, the multi-stream pool shares the drafter's weights across streams and its
+`DSparkMultiDrafter` block passes batch several streams; watch that admission still fits with the drafter's
+context pool beside the target's. `TF_GLM_DSPARK_TOP_K` (default 16) widens the candidate budget a row gives the
+chain, and the confidence head drives the `f<N>:<p>` stop policies through the same cumulative rule as before.
+
 ### Draft policies
 
 For the affine checkpoint with its MTP head loaded, the default `auto` policy uses MTP for sampled requests.
-For greedy requests with DFlash2 loaded beside the head (`TF_GLM_MTP=1`, the default),
-it compares committed tokens per estimated round time and chooses a drafter. It periodically probes
-the other drafter and discards its old rate after switching away, so later probes can change the choice.
-Without the head (`TF_GLM_MTP=auto` beside DFlash2, or `0`), `auto` drafts with DFlash2.
+For greedy requests with a block drafter (DSpark by default, DFlash2 when passed) loaded beside the head
+(`TF_GLM_MTP=1`, the default), it compares committed tokens per estimated round time and chooses a drafter. It
+periodically probes the other drafter and discards its old rate after switching away, so later probes can change
+the choice. Without the head (`TF_GLM_MTP=auto` beside a draft model, or `0`), `auto` drafts with the block
+drafter. DSpark drafts up to 8 tokens a round where DFlash2 offered its block minus one, and its confidence head
+feeds the same probability-product stop rules.
 Every policy verifies against the same target, and `"draft": false` selects the serial reference.
 A request can select a policy after `@` in its model ID, such as `bench@c3:0.35`, or with `tf_policy`.
-`--mtp-drafts N` selects a fixed depth at startup. With DFlash2 available, `--mtp-drafts 0` selects
+`--mtp-drafts N` selects a fixed depth at startup. With a draft model available, `--mtp-drafts 0` selects
 `fc5:0.3`; without it, zero selects the serial reference.
 
 | Policy | Meaning |
@@ -66,7 +91,7 @@ A request can select a policy after `@` in its model ID, such as `bench@c3:0.35`
 | `N` | Fixed number of MTP drafts |
 | `a:LOW:HIGH` | MTP depth from running acceptance |
 | `cN:P` | MTP chain capped at N and a probability-product threshold |
-| `fN`, `fcN:P`, `fa:...` | Corresponding DFlash2 policies, requiring its checkpoint |
+| `fN`, `fcN:P`, `fa:...` | Corresponding block-drafter policies, requiring its checkpoint |
 
 The default context is 2,051 tokens, where attention stays dense. A larger positive `--context` enables
 sparse attention beyond that boundary if the startup memory estimate admits it on both ranks.

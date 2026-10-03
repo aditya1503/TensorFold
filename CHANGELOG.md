@@ -3,6 +3,19 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## Unreleased
+
+- **GLM-5.3-Flash drafts with DSpark on CUDA.** The CUDA engine's optional draft model is now
+  `RedHatAI/GLM-5.3-Flash-speculator.dspark-preview` (MIT, the speculators format): a 5-layer block drafter with
+  a low-rank Markov logit-bias head and a confidence head, the semi-autoregressive scheme behind DeepSeek's
+  production decoder (arXiv 2607.05147). Every round drafts up to 8 tokens from one block pass, the anchor row
+  included (`sample_from_anchor`), the chain biases each position by the previous pick, and the learned
+  confidence head drives the same cumulative stop rule the `f<N>:<p>` policies already use; the per-request
+  drafter choice, the verify scheduling and `--parallel`'s multi-stream pool all work with it unchanged. The
+  incoai `GLM-5.3-Flash-DFlash2` checkpoint (CC BY-NC-ND 4.0) still loads when passed with `--drafter`, and the
+  engine refuses to start when the two ranks pull different drafters or drafter formats (the tap-layer count
+  joins the settings both ranks must agree on). Tests: `tests/test_glm_dspark_drafter.py`.
+
 ## 0.6.3 (2 Oct 2026)
 
 - **Nemotron on M5 Macs: copied text verifies up to 64 tokens a round.** A lone stream's copy window grows from 16 to

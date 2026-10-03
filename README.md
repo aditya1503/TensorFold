@@ -34,7 +34,7 @@ GLM-5.3-Flash images run on MLX; dense Qwen's run on MLX and CUDA. See
 | Nemotron 3.5 Lightning | `TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit` | MLX, CUDA | Included MTP head; context copies on MLX |
 | Qwen3.8-27B | `TensorFold/Qwen3.8-27B-MLX-4bit` | MLX, CUDA | `z-lab/Qwen3.8-27B-DFlash2` and context copies; DFlash2 is optional on MLX |
 | Qwen3.8 Flash Next | `TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP` | MLX, CUDA | Included MTP head and context copies |
-| GLM-5.3-Flash | `TensorFold/GLM-5.3-Flash-MLX-4bit-MTP` | MLX on a 256 GB Mac, CUDA with two ranks | MTP; optional DFlash2 on CUDA |
+| GLM-5.3-Flash | `TensorFold/GLM-5.3-Flash-MLX-4bit-MTP` | MLX on a 256 GB Mac, CUDA with two ranks | MTP; optional DSpark (RedHatAI, MIT) on CUDA |
 | Gemma 4 26B-A4B | `mlx-community/gemma-4-26b-a4b-it-4bit` | MLX | Context copies; `z-lab/gemma-4-26B-A4B-it-DFlash` is optional |
 | DeepSeek-V4-Flash | `mlx-community/DeepSeek-V4-Flash-4bit` | MLX on a 256 GB Mac | `TensorFold/DeepSeek-V4-Flash-DSpark-MLX` or `TensorFold/DeepSeek-V4-Flash-MTP-MLX` |
 | Qwen3.8-27B (NVFP4) | `nvidia/Qwen3.8-27B-NVFP4` (ModelOpt: NVFP4 MLP, FP8 attention) | CUDA, one GPU | `z-lab/Qwen3.8-27B-DFlash2` and context copies |
@@ -57,6 +57,8 @@ It reads packed rows in groups of 32, 64 and 128 on Apple Silicon and CUDA, with
 pending for the newer paths. M5 keeps its native tensor-unit kernels for compatible formats,
 and other formats use the row decoder. See [quantized checkpoints](docs/quantization.md) for the exact scope.
 On CUDA, pull DFlash2 before serving; without it, explicitly choose `--no-drafts` for the serial reference.
+See [decoding acceleration research](docs/decoding.md) for how MTP and DFlash2 compare with the wider
+method landscape, including memory overhead and measured speedups.
 
 Nemotron uses TensorFold projections and routed-expert kernels. Its load-time row check controls drafting;
 keep the installed MLX version within the package requirements. The named checkpoint includes
@@ -70,7 +72,8 @@ unless `--no-drafts` is set. GLM on MLX reads 4-bit/group-64 weights and mlx-lm'
 whose 5-, 6- and 8-bit tensors take their own row kernels; it needs MLX 0.32.2 or later. GLM CUDA reads
 MLX 4-bit/group-64 weights and Brandon M. Music's experimental EXL3/TR3 checkpoint
 (`brandonmusic/GLM-5.3-Flash-tr3-4bpw`, also re-hosted as `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`). GLM's optional
-`incoai/GLM-5.3-Flash-DFlash2` checkpoint has non-commercial license
+draft model is now RedHatAI's DSpark preview (`RedHatAI/GLM-5.3-Flash-speculator.dspark-preview`, MIT); the
+`incoai/GLM-5.3-Flash-DFlash2` checkpoint it replaced has non-commercial license
 terms, described in [third-party notices](THIRD_PARTY_NOTICES.md).
 
 Gemma 4 has no draft head. It drafts copies of its context, and chains from z-lab's DFlash model when served with

@@ -331,11 +331,14 @@ def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capa
 
     from tensorfold.cuda.geometry import draft_ring_rows
 
-    layers = int(t["num_hidden_layers"])
-    heads = int(t["num_key_value_heads"]) // world
-    hd = int(t["head_dim"])
-    block = int((t.get("dflash_config") or {}).get("block_size", 16))
-    window = int(t.get("sliding_window", 0))
+    from tensorfold.cuda.geometry import draft_backbone, draft_block_size
+
+    b = draft_backbone(t)
+    layers = int(b["num_hidden_layers"])
+    heads = int(b["num_key_value_heads"]) // world
+    hd = int(b["head_dim"])
+    block = draft_block_size(t)
+    window = int(b.get("sliding_window", 0))
     ring_rows = draft_ring_rows(window - 1, block) if ring and window > 0 else 0
     cap = ring_rows if 0 < ring_rows < capacity + block else capacity + block
     trash = -(-max(64, streams * tap_rows) // block) * block
@@ -399,11 +402,14 @@ def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capa
 
     from tensorfold.cuda.geometry import draft_ring_rows
 
-    layers = int(t["num_hidden_layers"])
-    heads = int(t["num_key_value_heads"]) // world
-    hd = int(t["head_dim"])
-    block = int((t.get("dflash_config") or {}).get("block_size", 16))
-    window = int(t.get("sliding_window", 0))
+    from tensorfold.cuda.geometry import draft_backbone, draft_block_size
+
+    b = draft_backbone(t)
+    layers = int(b["num_hidden_layers"])
+    heads = int(b["num_key_value_heads"]) // world
+    hd = int(b["head_dim"])
+    block = draft_block_size(t)
+    window = int(b.get("sliding_window", 0))
     ring_rows = draft_ring_rows(window - 1, block) if ring and window > 0 else 0
     cap = ring_rows if 0 < ring_rows < capacity + block else capacity + block
     trash = -(-max(64, streams * tap_rows) // block) * block
@@ -584,12 +590,15 @@ class GlmEngine:
         else:
             verify_code = [verify_code]
         # both ranks must run the same calls: refuse to start when they were given different settings
+        from .dspark import drafter_kind, drafter_taps
+
+        self.draft_kind = drafter_kind(drafter) if drafter is not None else ""
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
                 prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
-                                 KV_KINDS.index(kv)]
+                                 KV_KINDS.index(kv), drafter_taps(drafter)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -633,7 +642,7 @@ class GlmEngine:
                   f"the {self.limit}-token window leaves (TF_GLM_CACHE_GIB asks {wanted / 2 ** 30:.1f})", flush=True)
         if not self.mtp_on and drafter is None and not serial_only:
             raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
-                             "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
+                             "no draft model was given, so every round would decode one token: pull the draft "
                              "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
         # --parallel: one pool of per-token caches for every stream, sized by what the budget leaves over the
         # window's own (no kept prompts beside it in this version)
@@ -645,12 +654,14 @@ class GlmEngine:
         if rank == 0 and cfg.mtp_layers and not self.mtp_on:
             print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
                   (os.environ.get("TF_GLM_MTP", "").strip() or MTP_DEFAULT) + "): " +
-                  ("DFlash2 drafts every request" if drafter is not None else "--no-drafts"), flush=True)
+                  ((("DSpark" if self.draft_kind == "dspark" else "DFlash2") + " drafts every request")
+                   if drafter is not None else "--no-drafts"), flush=True)
         self.drafter = None
         if drafter is not None:
-            from .dflash2 import Drafter
+            from .dspark import drafter_class
 
-            self.drafter = Drafter(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
+            self.drafter = drafter_class(drafter)(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS,
+                                                  ring=DRAFT_RING)
         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
                         graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
@@ -708,7 +719,8 @@ class GlmEngine:
             mtp = (f"; MTP draft {c['mtp']:.2f} (+{c['mtp_step']:.2f} a chained draft, +{c['mtp_row']:.2f} a row)"
                    if w.mtp is not None else "")
             print("[tensorfold] drafter costs (ms): verify " + " ".join(f"{v:.1f}" for v in c["verify"]) + mtp +
-                  f"; DFlash2 block {c['block']:.2f} (+{c['taps_row']:.3f} a tap row)", flush=True)
+                  f"; {'DSpark' if self.draft_kind == 'dspark' else 'DFlash2'} block {c['block']:.2f} "
+                  f"(+{c['taps_row']:.3f} a tap row)", flush=True)
         self.vision = None                   # rank 0's image tower (``tensorfold.vision.glm.GlmVision``), --vision
         if vision:
             from tensorfold.vision.glm import GlmVision
