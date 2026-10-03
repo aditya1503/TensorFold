@@ -6,27 +6,23 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tensorfold.cuda.server import App, PreparedRequest, RequestError
+from tensorfold.families.glm5_next.prompts import clear_thinking, thinking_off
 from tensorfold.server.errors import CONTEXT_LIMIT
-from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
-from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
 
 
 class ThinkingOffTemplate:
-    """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off
-    (``prompts.thinking_off``, as the Mac's tokenizer renders it), an agent's history made renderable first
-    (``prompts.agent_history``), with the reasoning of tool-calling steps the client dropped put back (``kept``,
-    ``kept_reasoning.KeptReasoning``; None: off)."""
+    """The checkpoint template as GLM-5.3's thinking-off template renders it (``prompts.thinking_off``), with earlier
+    turns' reasoning kept unless the request's ``chat_template_kwargs.clear_thinking`` says otherwise
+    (``prompts.clear_thinking``)."""
 
-    def __init__(self, inner, kept: KeptReasoning | None = None) -> None:
+    def __init__(self, inner, clear: bool | None = None) -> None:
         self.inner = inner
         self.efforts = getattr(inner, "efforts", frozenset())
-        self.kept = kept
+        self.clear = clear_thinking() if clear is None else clear
 
-    def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
-        if self.kept is not None:
-            messages = self.kept.restore(messages)
-        text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
-                                 allow_images=allow_images)
+    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
+        extra = {"clear_thinking": self.clear, **(extra or {})}       # a request's own value wins
+        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
         return text if enable_thinking else thinking_off(text)
 
 

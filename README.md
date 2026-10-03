@@ -5,13 +5,13 @@ Each model family supplies its own kernels and draft verification.
 
 ```bash
 python -m pip install git+https://github.com/ashhart/TensorFold.git
-tensorfold serve Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
+tensorfold serve TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
 ```
 
 On a Mac, Homebrew installs it too: `brew install ashhart/tensorfold/tensorfold`.
 
 Use `http://127.0.0.1:8080/v1` as the client base URL and the model ID from `/v1/models`. Both backends serve chat
-completions, completions and OpenAI's Responses API (`/v1/responses`); see the [API reference](docs/api.md).
+completions, completions, OpenAI Responses (`/v1/responses`) and Anthropic Messages (`/v1/messages`); see the [API reference](docs/api.md).
 Python 3.11 or newer is required, and MLX 0.32.2 or newer on a Mac (pip installs it). See the [runbook](RUNBOOK.md)
 for installation and a first request. On NVIDIA GPUs the CUDA kernels need compute capability 8.9 or newer: Ada (RTX 40
 series), Hopper and Blackwell, including the DGX Spark's GB10 and the RTX 50 series. NVFP4 and FP8 checkpoints run from
@@ -31,12 +31,12 @@ GLM-5.3-Flash images run on MLX; dense Qwen's run on MLX and CUDA. See
 
 | Model | Checkpoint | Backend | Drafting |
 | --- | --- | --- | --- |
-| Nemotron 3.5 Lightning | `Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit` | MLX, CUDA | Included MTP head; context copies on MLX |
-| Qwen3.8-27B | `Vontra/Qwen3.8-27B-MLX-4bit` | MLX, CUDA | `z-lab/Qwen3.8-27B-DFlash2` and context copies; DFlash2 is optional on MLX |
-| Qwen3.8 Flash Next | `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP` | MLX, CUDA | Included MTP head and context copies |
-| GLM-5.3-Flash | `Vontra/GLM-5.3-Flash-MLX-4bit-MTP` | MLX on a 256 GB Mac, CUDA with two ranks | MTP; optional DFlash2 on CUDA |
+| Nemotron 3.5 Lightning | `TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit` | MLX, CUDA | Included MTP head; context copies on MLX |
+| Qwen3.8-27B | `TensorFold/Qwen3.8-27B-MLX-4bit` | MLX, CUDA | `z-lab/Qwen3.8-27B-DFlash2` and context copies; DFlash2 is optional on MLX |
+| Qwen3.8 Flash Next | `TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP` | MLX, CUDA | Included MTP head and context copies |
+| GLM-5.3-Flash | `TensorFold/GLM-5.3-Flash-MLX-4bit-MTP` | MLX on a 256 GB Mac, CUDA with two ranks | MTP; optional DFlash2 on CUDA |
 | Gemma 4 26B-A4B | `mlx-community/gemma-4-26b-a4b-it-4bit` | MLX | Context copies; `z-lab/gemma-4-26B-A4B-it-DFlash` is optional |
-| DeepSeek-V4-Flash | `mlx-community/DeepSeek-V4-Flash-4bit` | MLX on a 256 GB Mac | `Vontra/DeepSeek-V4-Flash-DSpark-MLX` or `Vontra/DeepSeek-V4-Flash-MTP-MLX` |
+| DeepSeek-V4-Flash | `mlx-community/DeepSeek-V4-Flash-4bit` | MLX on a 256 GB Mac | `TensorFold/DeepSeek-V4-Flash-DSpark-MLX` or `TensorFold/DeepSeek-V4-Flash-MTP-MLX` |
 | Qwen3.8-27B (NVFP4) | `nvidia/Qwen3.8-27B-NVFP4` (ModelOpt: NVFP4 MLP, FP8 attention) | CUDA, one GPU | `z-lab/Qwen3.8-27B-DFlash2` and context copies |
 | Qwen3.8-27B (EXL3, experimental) | `turboderp/Qwen3.8-27B-exl3` (branches `3.00bpw`, `4.00bpw`; any codebook, 1 to 8 bits per weight) | CUDA | `z-lab/Qwen3.8-27B-DFlash2` and context copies |
 | Qwen3.8 Flash Next (EXL3, experimental) | `turboderp/Qwen3.8-Flash-Next-exl3` (branch `3.05bpw_h5_ng5`; any codebook, a width per tensor) | CUDA | Included MTP head and context copies |
@@ -45,10 +45,11 @@ GLM-5.3-Flash images run on MLX; dense Qwen's run on MLX and CUDA. See
 
 `tensorfold models` lists families and checkpoints. `tensorfold info MODEL` checks configuration without
 fetching weights. `serve` downloads a missing checkpoint; `pull` downloads it ahead of time.
+Those `TensorFold/...` ids moved from the `Vontra` org on Hugging Face on 2 October 2026; the old names redirect.
 
 ```bash
-tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit
+tensorfold pull TensorFold/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit
 ```
 
 Qwen3.8-27B reads MLX affine 2-, 3-, 4-, 5-, 6- and 8-bit checkpoints, including mixed layer formats.
@@ -79,7 +80,7 @@ before downloading.
 
 DeepSeek-V4-Flash reads the mlx-community conversion (affine 4-bit/group-64 weights, mxfp4 routed experts) and
 needs MLX 0.32.2 or later. Its draft heads are DeepSeek's DSpark blocks and MTP layer (MIT), converted:
-`tensorfold pull Vontra/DeepSeek-V4-Flash-DSpark-MLX` once and `serve` drafts with it; see
+`tensorfold pull TensorFold/DeepSeek-V4-Flash-DSpark-MLX` once and `serve` drafts with it; see
 [its recipe](docs/recipes/deepseek-v4-flash.md).
 
 See the [recipes](docs/recipes/README.md) for supported formats and backend limits.
@@ -109,6 +110,7 @@ between MLX and CUDA, different quantizations, or different tensor-parallel rank
 | `--name` | Model ID advertised to clients | Both |
 | `--vision` | Opt-in GLM-5.3-Flash, Qwen3.5/3.8 dense and Flash Next image input | MLX; dense Qwen also CUDA; Flash Next CUDA with `--parallel >=2` |
 | `--vision-max-images N` | With `--vision`, images across the full request history (default 4); other image limits still apply | Both |
+| `--vision-image-tokens N` | With `--vision`, the visual tokens a request's images share (default 4,096, up to 65,536); each image keeps at most 4,096 | CUDA Qwen |
 | `--alias` | Additional model IDs | MLX |
 | `--context N` | Prompt plus reply capacity | Both |
 | `--max-tokens N` | Default reply limit, 4096 | Both |
@@ -160,6 +162,12 @@ its smaller cache, so the same memory admits a longer window. Explicit `--contex
 A positive CUDA value must fit both the native window and the capacity estimate on every rank;
 otherwise startup refuses it with fitting guidance. Increasing GLM beyond its dense window enables
 its sparse-attention path. The startup report distinguishes native and allocated capacity.
+The CUDA budget grants a GPU its free memory less a floor of a tenth of that memory, at least 4 GiB: a discrete
+card's own memory, or the host's available memory on a unified GPU. `TENSORFOLD_MEMORY_RESERVE_GIB` moves the
+floor (at least 2 GiB), and `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` caps the grant from above in GiB, an absolute budget
+like `TENSORFOLD_MEMORY_LIMIT_GB` on the MLX side. A smaller floor can end requests with CUDA errors mid-reply,
+and a floor you choose takes that risk knowingly. A discrete card's host need is its loading buffers, which
+startup weighs on its own.
 
 MLX defaults to a process budget of 70% of RAM. A family can state a larger share: GLM-5.3-Flash takes 85%
 on a Mac with 256 GB or less, with nothing else loaded. `TENSORFOLD_MEMORY_LIMIT_GB` replaces that default in
@@ -245,8 +253,8 @@ Use NVIDIA's PyTorch container for CUDA, PyTorch, Triton and the extension compi
 ```bash
 docker run -it --gpus all --ipc=host --network host nvcr.io/nvidia/pytorch:26.07-py3
 python -m pip install git+https://github.com/ashhart/TensorFold.git
-tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0
+tensorfold pull TensorFold/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --host 0.0.0.0
 ```
 
 Qwen3.8-27B, Flash Next and Nemotron support one or two CUDA ranks; GLM requires two.
@@ -274,6 +282,7 @@ every release. The first time a new version serves, it prints one line linking t
 
 ## Development and license
 
+To send a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 Family interfaces, kernel layout and verification requirements are in the [recipe book](docs/recipes/README.md),
 [family map](src/tensorfold/families/README.md) and [kernel map](src/tensorfold/kernels/README.md).
 Apache-2.0 from 0.6.0; see [LICENSE](LICENSE), [NOTICE](NOTICE) and [third-party notices](THIRD_PARTY_NOTICES.md).

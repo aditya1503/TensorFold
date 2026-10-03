@@ -80,7 +80,7 @@ def first(a: mx.array) -> mx.array:
 
 
 _checked: set[tuple[int, int, int]] = set()
-# "lane": lane_qmm; "rows": per-row kernels; "simd": simd_qmm, selected by TF_FLASH_DENSE.
+# "lane": lane_qmm. "rows": per-row kernels. "simd": 4-bit groups of 32. "matrix": every width before M5.
 DENSE = os.environ.get("TF_FLASH_DENSE") or ("lane" if tensor_units() else "rows")
 _lane: dict[int, tuple[mx.array, mx.array, mx.array, int]] = {}   # id(linear) -> weight, tiled copy, scales, tile
 
@@ -112,6 +112,39 @@ def _lane_project(x: mx.array, linear: Any) -> mx.array:
     return mx.concatenate(parts).reshape(*x.shape[:-1], -1)
 
 
+_matrix: dict[int, tuple[mx.array, mx.array, mx.array, int]] = {}   # id(linear) -> weight, scales, biases, group
+_MATRIX_BACKEND: Any = None
+
+
+def _matrix_project(x: mx.array, linear: Any) -> mx.array:
+    """Every affine width on the matrix units before M5, the same kernel at every row count."""
+
+    global _MATRIX_BACKEND
+    from tensorfold.kernels.qwen.dense.v1 import row_matmul
+
+    if _MATRIX_BACKEND is None:
+        _MATRIX_BACKEND = row_matmul.simd_qmm_backend()
+    weight = linear.weight
+    hit = _matrix.get(id(linear))
+    if hit is None or hit[0] is not weight:
+        scales, biases, group = linear.scales, linear.biases, int(linear.group_size)
+        if group == 128 and int(linear.bits) == 4:  # 4-bit still reads a group of 128 as two of 64
+            scales, biases, group = mx.repeat(scales, 2, axis=1), mx.repeat(biases, 2, axis=1), 64
+        mx.eval(scales, biases)
+        _MATRIX_BACKEND.prepare([(weight, scales, biases, group, int(linear.bits))])
+        hit = _matrix[id(linear)] = (weight, scales, biases, group)
+    _, scales, biases, group = hit
+    k = int(x.shape[-1])
+    rows = x.size // k
+    most = _MATRIX_BACKEND.max_rows
+    if rows <= most:
+        return _MATRIX_BACKEND(x, weight, scales, biases, group, int(linear.bits))
+    flat = x.reshape(rows, k)
+    parts = [_MATRIX_BACKEND(flat[i:i + most], weight, scales, biases, group, int(linear.bits))
+             for i in range(0, rows, most)]
+    return mx.concatenate(parts).reshape(*x.shape[:-1], -1)
+
+
 def unreadable(*models: Any) -> dict[str, int]:
     """Quantized linears, by kind, whose width, group or mode the lane matmul does not read (shapes are not checked)."""
 
@@ -126,6 +159,18 @@ def unreadable(*models: Any) -> dict[str, int]:
     return counts
 
 
+def _default_matrix(linear: Any) -> bool:
+    """Unset switch: the fused GDN stack, 4-bit group 64 at 16480 x 2560, uses the matrix kernel."""
+
+    if os.environ.get("TF_FLASH_DENSE") or DENSE != "rows":
+        return False
+    if (int(linear.bits), int(linear.group_size)) != (4, 64):
+        return False
+    n = int(linear.weight.shape[0])
+    k = int(linear.weight.shape[1]) * 32 // int(linear.bits)
+    return n == 16480 and k == 2560
+
+
 def project(x: mx.array, linear: Any) -> mx.array:
     """x [..., R, K] through an affine linear, a row's bits independent of R: per-row kernels before M5, lane_qmm on M5."""
 
@@ -133,6 +178,8 @@ def project(x: mx.array, linear: Any) -> mx.array:
         return linear(x)
     if DENSE == "lane":
         return _lane_project(x, linear)
+    if DENSE == "matrix" or _default_matrix(linear):        # before M5: every width on the matrix units
+        return _matrix_project(x, linear)
     if (linear.bits, linear.group_size) != (4, 32):         # other widths before M5: every row alone, at any count
         return rows.qmv_rows(x, linear)
     if DENSE == "rows":

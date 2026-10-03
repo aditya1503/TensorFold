@@ -19,9 +19,9 @@ tensorfold models
 Choose a model explicitly. This example uses Nemotron with its included MTP head:
 
 ```bash
-tensorfold info Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
-tensorfold pull Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
-tensorfold serve Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit --name local-model --context 8192
+tensorfold info TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
+tensorfold pull TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
+tensorfold serve TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit --name local-model --context 8192
 ```
 
 `info` reads configuration only. `pull` downloads weights; `serve` completes a missing download.
@@ -58,8 +58,8 @@ Start NVIDIA's container, then install and serve inside it:
 nvidia-smi
 docker run -it --gpus all --ipc=host --network host nvcr.io/nvidia/pytorch:26.07-py3
 python -m pip install git+https://github.com/ashhart/TensorFold.git
-tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --name local-model --host 0.0.0.0 --port 8080
+tensorfold pull TensorFold/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --name local-model --host 0.0.0.0 --port 8080
 ```
 
 The first start compiles kernels. Container removal discards an unpersisted installation and cache;
@@ -88,8 +88,8 @@ RoCE devices for the one port; list both, `NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1`.
 rank 0:
 
 ```bash
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 1 --master 192.0.2.1
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 0 --master 192.0.2.1 --name local-model --host 0.0.0.0
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --tp 2 --rank 1 --master 192.0.2.1
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --tp 2 --rank 0 --master 192.0.2.1 --name local-model --host 0.0.0.0
 ```
 
 Replace the documentation address with rank 0's reachable address. Both ranks must agree on context and
@@ -106,8 +106,8 @@ compiler from NVIDIA's own wheels, all in a virtual environment, with no root an
 python3 -m venv ~/tf-venv && . ~/tf-venv/bin/activate
 python -m pip install torch ninja "cuda-toolkit[nvcc,cccl]==13.0.*"
 python -m pip install git+https://github.com/ashhart/TensorFold.git
-tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --name local-model --host 127.0.0.1 --port 8080
+tensorfold pull TensorFold/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
+tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --name local-model --host 127.0.0.1 --port 8080
 ```
 
 Match the compiler wheel to torch's CUDA version, which `python -c "import torch; print(torch.version.cuda)"`
@@ -137,12 +137,23 @@ On MLX, `TENSORFOLD_MEMORY_LIMIT_GB` sets the process budget in GiB in place of 
 It can raise or lower the budget, within physical RAM and the GPU's recommended working set:
 
 ```bash
-TENSORFOLD_MEMORY_LIMIT_GB=110 tensorfold serve Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP
+TENSORFOLD_MEMORY_LIMIT_GB=110 tensorfold serve TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP
 ```
 
 On a 128 GiB M4 Max this gives 110 GiB to the process and 107 GiB to MLX after the 3 GiB reserve.
 The same budget reaches concurrent admission; context and request memory checks still apply.
 
+On CUDA, a discrete card's admission budget is its own free memory; on a unified GPU it is the host's
+available memory less a floor of a tenth of RAM, at least 4 GiB. `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` caps that
+grant from above in GiB, an absolute budget like the MLX one; free memory still caps it:
+
+```bash
+TENSORFOLD_CUDA_MEMORY_LIMIT_GB=31 tensorfold serve nvidia/Qwen3.8-27B-NVFP4
+```
+
+A budget close to a shared pool can end requests with CUDA errors mid-reply, which is why a unified GPU keeps
+its floor; `TENSORFOLD_MEMORY_RESERVE_GIB` moves that floor. A discrete card's host need is its loading
+buffers, which startup checks on its own.
 Requested replies need cache space too. Reduce context, reply length, retained prefixes on MLX, or
 checkpoint size after a memory refusal. The MLX process budget reserves 3 GiB outside the allocator.
 Release-qualified memory and speed results are TBD [release-0.3.5]; see the

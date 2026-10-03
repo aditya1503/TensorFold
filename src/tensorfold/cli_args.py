@@ -32,9 +32,16 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                           help="enable image input for supported GLM and Qwen vision checkpoints")
     endpoint.add_argument("--vision-urls", action="store_true",
                           help="with --vision, accept public HTTP(S) image URLs (default: data URLs only)")
+    endpoint.add_argument("--vision-offload", action="store_true",
+                          help="with --vision on CUDA, keep the image tower in host RAM and copy it to the GPU only "
+                               "while an image is encoded (frees about 5 GiB of the startup budget on a small card; "
+                               "each image pays the copy)")
     endpoint.add_argument("--vision-max-images", type=int, default=None,
                           help="with --vision, maximum images across the full request history (default: 4); "
                                "byte, pixel and visual-token limits still apply")
+    endpoint.add_argument("--vision-image-tokens", type=int, default=None,
+                          help="with --vision on CUDA Qwen checkpoints, the visual tokens a request's images share "
+                               "(default: 4096, at most 65536); each image keeps at most 4096")
 
     generation = serve.add_argument_group("generation (requests can override each of these)")
     generation.add_argument("--context", type=int, default=None,
@@ -141,7 +148,7 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     serve.set_defaults(func=handlers["serve"])
 
     pull = commands.add_parser("pull", help="download models (or draft models) from Hugging Face")
-    pull.add_argument("repos", nargs="+", help="repo ids, e.g. Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP")
+    pull.add_argument("repos", nargs="+", help="repo ids, e.g. TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP")
     pull.set_defaults(func=handlers["pull"])
 
     models = commands.add_parser("models", help="list the model families and the checkpoints they are tested with")
@@ -155,4 +162,7 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     info = commands.add_parser("info", help="show which family serves a model (reads its config.json only)")
     info.add_argument("model", help="a Hugging Face repo id or a model directory")
     info.set_defaults(func=handlers["info"])
+    from tensorfold.control.cli import register
+
+    register(commands)
     return parser
