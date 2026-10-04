@@ -6,7 +6,6 @@ from typing import Any, Callable
 from tensorfold.server.errors import RequestError
 
 _MEDIA = ("image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url")
-_IMAGE_ROLES = ("user", "tool")    # a tool result may carry images (an agent's screenshots): templates render them
 
 
 def validate_modalities(body: dict[str, Any]) -> None:
@@ -50,8 +49,8 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
         content = message.get("content")
         if isinstance(content, list) and allow_images and any(
                 isinstance(p, dict) and p.get("type") in _VISUAL for p in content):
-            if role not in _IMAGE_ROLES:
-                raise RequestError("images and videos are supported only in user and tool messages")
+            if role != "user":
+                raise RequestError("images and videos are supported only in user messages")
             for part in content:
                 if not isinstance(part, dict) or part.get("type") not in ("text", *_VISUAL):
                     raise RequestError("image messages may contain text and image_url (or video_url) parts only")
@@ -93,7 +92,7 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
 
 
 def _normalize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Copy tool arguments into mappings for templates; invalid ones go under ``_invalid_arguments``, not a crash."""
+    """Copy assistant argument strings into mappings for templates, preserving caller messages."""
 
     if not messages:
         return messages
@@ -109,17 +108,14 @@ def _normalize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[
         for call in calls:
             fn = call.get("function") if isinstance(call, dict) else None
             args = fn.get("arguments") if isinstance(fn, dict) else None
-            if isinstance(fn, dict) and "arguments" in fn and not isinstance(args, dict):
-                parsed = args
-                if isinstance(args, str):
-                    try:
-                        parsed = json.loads(args)
-                    except (ValueError, TypeError):
-                        parsed = None
-                if not isinstance(parsed, dict):
-                    parsed = {"_invalid_arguments": args}
-                call = {**call, "function": {**fn, "arguments": parsed}}
-                touched = True
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    call = {**call, "function": {**fn, "arguments": parsed}}
+                    touched = True
             new_calls.append(call)
         if touched:
             out.append({**message, "tool_calls": new_calls})

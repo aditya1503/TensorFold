@@ -17,8 +17,7 @@ from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
 from tensorfold.server.probabilities import TokenBytes, probability_options
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
-from tensorfold.server.stopping import matched_stop, stop_options
-from tensorfold.server.token_routes import flag, token_ids
+from tensorfold.server.stopping import stop_options
 from tensorfold.server.tool_policy import ToolCallPolicy
 from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
 from tensorfold.engine.tool_draft import ToolCallStreamer
@@ -76,15 +75,12 @@ class App:
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
                  context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0,
-                 aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None,
-                 vision_image_tokens: int | None = None):
+                 aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None):
         from tokenizers import Tokenizer
 
         self.engine = engine
         self.vision = getattr(engine, "vision", None)
-        self.image_limits = DEFAULT_LIMITS if vision_max_images is None and vision_image_tokens is None else \
-            ImageLimits(**({} if vision_max_images is None else {"max_images": vision_max_images}),
-                        **({} if vision_image_tokens is None else {"max_visual_tokens": vision_image_tokens}))
+        self.image_limits = DEFAULT_LIMITS if vision_max_images is None else ImageLimits(max_images=vision_max_images)
         self.served = served
         self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
         self.model_dir = Path(model_dir)
@@ -193,13 +189,6 @@ class App:
         turns = self._turns()
         turns.take(False)
         try:
-            many = getattr(self.engine, "score_labels_many", None)
-            if many is not None and len(prepared) > 1:   # the questions' prompts fill together
-                try:
-                    scored = many([(item.prompt_ids, item.label_ids) for item in prepared])
-                except ValueError as exc:
-                    raise RequestError(f"questions: {exc}") from exc
-                return build_response(body, prepared, scored)
             scored = []
             for item in prepared:
                 try:

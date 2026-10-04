@@ -46,7 +46,7 @@ class FlashNextEngine:
         exl3 = is_exl3(model_dir)
         if (exl3 or quant_method(read_config(model_dir)) == "modelopt") and tp != 1:
             raise ValueError(f"{'EXL3 packs' if exl3 else 'NVFP4 checkpoints'} of Flash Next run on one GPU: drop --tp "
-                             "2, or serve the MLX checkpoint (TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP) on two")
+                             "2, or serve the MLX checkpoint (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) on two")
         if vision and (streams < 2 or tp != 1):
             raise ValueError("image input on Flash Next runs on one GPU with --parallel 2 or more")
         if exl3 and ple_on_ssd:
@@ -57,11 +57,7 @@ class FlashNextEngine:
         from .kvcache import BITS_OF, check as check_kv
         from .weights import draft_token_ids, load
         from tensorfold.cuda.capacity import admit, config, gather_ints
-        from tensorfold.cuda.geometry import (PREFILL_ROWS, gdn_geometry, indexed_prefill_rows,
-                                              indexed_stream_geometry, indexed_weights)
-
-        # TENSORFOLD_PREFILL_ROWS: prompt pieces of that many rows, admitted with the window (not the idle plan)
-        chunk = None if is_exl3(model_dir) else indexed_prefill_rows()
+        from tensorfold.cuda.geometry import PREFILL_ROWS, gdn_geometry, indexed_stream_geometry, indexed_weights
 
         if tp not in (1, 2) or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU or two")
@@ -88,12 +84,10 @@ class FlashNextEngine:
         gather = (lambda values: gather_ints(torch, self.comm.all_gather, values)) if tp == 2 else None
         each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
-        rows0 = chunk or PREFILL_ROWS
-        geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits,
-                                                          prefill_rows=rows0))
+        geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits))
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
-                                               kept=KEEP_SERIAL + 1, prefill_rows=rows0)))
+                                               kept=KEEP_SERIAL + 1)))
         if exl3:
             geometry = admission(geometry)
         from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights
@@ -104,7 +98,7 @@ class FlashNextEngine:
                                    vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
                                    rank=rank, world=tp,
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
-        self.prefill_rows, prompt_workspace = (PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
+        self.prefill_rows, prompt_workspace = (PREFILL_ROWS, 0) if exl3 else prompt_plan(
             self.capacity_plan, config(model_dir), torch.cuda.get_device_capability(), world=tp, vision=vision,
             fp8=prompt_precision.fp8())
         if prompt_workspace:
@@ -146,7 +140,7 @@ class FlashNextEngine:
             self.vision = QwenCudaVision(model_dir, torch.device("cuda", 0),
                                          allow_urls=vision_urls)
             torch.cuda.empty_cache()
-            print(f"[tensorfold] vision: image{' and video' if self.vision.videos else ''} input, a "
+            print(f"[tensorfold] vision: image input, a "
                   f"{self.vision.weight_bytes / 2**30:.2f} GiB tower with {vision_workspace() / 2**30:.2f} GiB of "
                   f"workspace reserved{'; https URLs allowed' if vision_urls else ''}", flush=True)
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
@@ -221,15 +215,14 @@ class FlashNextEngine:
         total = int(ids.sum()) if ids is not None else -1
         mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len,
                              len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype],
-                             self.prefill_rows, int(prompt_precision.fp8())], dtype=torch.int64, device="cuda")
+                             int(prompt_precision.fp8())], dtype=torch.int64, device="cuda")
         both = torch.empty((2 * mine.numel(),), dtype=torch.int64, device="cuda")
         self.comm.all_gather(mine, both)
         both = both.view(2, -1).cpu()
         prompt_precision.same_on_ranks(int(both[0, -1]), int(both[1, -1]))
         if not torch.equal(both[0], both[1]):
             raise RuntimeError(f"the two ranks were started with different settings (drafts, confidence, context, "
-                               f"draft vocabulary, KV cache, prompt rows): rank 0 {both[0].tolist()}, "
-                               f"rank 1 {both[1].tolist()}")
+                               f"draft vocabulary, KV cache): rank 0 {both[0].tolist()}, rank 1 {both[1].tolist()}")
 
     def _key(self, n: int) -> str:
         return f"tensorfold/flashnext/request/{n}"
@@ -418,57 +411,6 @@ class FlashNextEngine:
             return self._serial(prompt, max_tokens, sampling, on_tokens, constraint, stop_eos, probabilities=probabilities)
         return self._decode(prompt, max_tokens, sampling, on_tokens, hit, constraint, stop_eos,
                             probabilities=probabilities, points=points)
-
-    def score_labels(self, prompt_ids, label_ids) -> tuple[list[float], float]:
-        """Score the prompt's final row in a fresh state without adding a kept decision prefix."""
-
-        return self.score_labels_many([(prompt_ids, label_ids)])[0]
-
-    def score_labels_many(self, items) -> list[tuple[list[float], float]]:
-        """``score_labels`` for several prompts at once: under ``--parallel`` they fill together."""
-
-        import math
-
-        from tensorfold.engine.exact_sampling import Sampling
-        from tensorfold.engine.probabilities import LabelProbabilities
-
-        if not self.supports_logprobs:
-            raise ValueError("decision labels are scored on one GPU only")
-        work = []
-        for prompt_ids, label_ids in items:
-            prompt, labels = [int(t) for t in prompt_ids], [int(t) for t in label_ids]
-            if not prompt:
-                raise ValueError("empty prompt")
-            if not labels:
-                raise ValueError("empty labels")
-            if any(token < 0 or token >= self.w.cfg.vocab for token in labels):
-                raise ValueError("decision label is outside the vocabulary")
-            self._limit(prompt, 1)
-            work.append((prompt, LabelProbabilities(labels, start=len(prompt))))
-
-        def one(job):
-            prompt, probe = job
-            self.generate(prompt, 1, Sampling(seed=0, temperature=0.0), lambda new: None, draft=False,
-                          probabilities=probe)
-            if probe.label_logits is None or probe.logsumexp is None:
-                raise ValueError("the prompt's last position was not scored")
-            if not math.isfinite(probe.logsumexp) or not all(math.isfinite(v) for v in probe.label_logits):
-                raise ValueError("label scoring produced a non-finite logit")
-            return probe.label_logits, probe.logsumexp
-
-        if self.scheduler is None or len(work) == 1:
-            return [one(job) for job in work]
-        greedy = Sampling(seed=0, temperature=0.0)
-        self.scheduler.submit_many([{"prompt": prompt, "count": 1, "sampling": greedy, "draft": False,
-                                     "probabilities": probe} for prompt, probe in work])
-        out = []
-        for _, probe in work:
-            if probe.label_logits is None or probe.logsumexp is None:
-                raise ValueError("the prompt's last position was not scored")
-            if not math.isfinite(probe.logsumexp) or not all(math.isfinite(v) for v in probe.label_logits):
-                raise ValueError("label scoring produced a non-finite logit")
-            out.append((probe.label_logits, probe.logsumexp))
-        return out
 
     def follow(self) -> None:
         """Rank 1: decode every request rank 0 serves, until rank 0 stops."""
