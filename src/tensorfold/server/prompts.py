@@ -40,15 +40,15 @@ def image_slot():
     return IMAGE_SLOTS
 
 
-def prepare_images(frontend, messages, render, *, context_limit=None):
+def prepare_images(frontend, messages, render, *, context_limit=None, limits=None):
     from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, load_images, split_images
 
     if frontend is None:
         raise RequestError('image input requires a supported vision checkpoint served with --vision')
     allow_urls = bool(getattr(frontend, 'allow_urls', False))
     videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
-    # a frontend's own limits (GLM: up to 50 pictures and 4 clips a request); the shared ones otherwise
-    limits = getattr(frontend, 'image_limits', None) or DEFAULT_LIMITS
+    # the server's limits (a --vision-max-images setting), then a frontend's own, then the shared ones
+    limits = limits or getattr(frontend, 'image_limits', None) or DEFAULT_LIMITS
     try:
         template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos,
                                          max_videos=getattr(frontend, 'max_videos', None))

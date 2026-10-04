@@ -55,6 +55,21 @@ def test_every_cuda_module_imports(allocations):  # noqa: F811
         importlib.import_module(name)
 
 
+def test_prepare_images_takes_the_servers_limits():
+    """The serving call site passes limits= (cuda/server.py: a --vision-max-images setting) into
+    prepare_images; the extracted serving tree's signature rejected the kwarg, and every request with an
+    image 400'd with a TypeError — a latent bug the original image carried too, until anyone sent it one.
+    The kwarg takes priority when given, and callers that pass nothing keep the frontend-default chain."""
+
+    import inspect
+
+    from tensorfold.server import prompts
+
+    signature = inspect.signature(prompts.prepare_images)
+    assert "limits" in signature.parameters and signature.parameters["limits"].default is None
+    signature.bind(object(), [], None, context_limit=1, limits=object())   # the patched call site's shape
+
+
 def test_the_shipped_dspark_checkpoint_parses(allocations):  # noqa: F811
     """The RedHatAI preview's config.json, as the loader reads it (skipped where the checkpoint is not pulled)."""
 
