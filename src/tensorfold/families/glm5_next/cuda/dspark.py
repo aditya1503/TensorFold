@@ -88,7 +88,10 @@ def read_speculators_config(cfg: dict) -> dict:
     out = {
         "block": int(cfg["block_size"]),
         "mask_id": int(cfg["mask_token_id"]),
-        "taps": tuple(int(i) for i in cfg["aux_hidden_state_layer_ids"]),
+        # speculators names HF output_hidden_states indices (the state entering a layer); this engine's taps are the
+        # states after a layer runs, so an aux id L feeds the drafter from engine layer L - 1. Verified by A/B: the
+        # shift takes periodic-text acceptance from 0.32 to 222 of 224 drafts accepted.
+        "taps": tuple(int(i) - 1 for i in cfg["aux_hidden_state_layer_ids"]),
         "hidden": int(tlc["hidden_size"]),
         "hd": int(tlc["head_dim"]),
         "heads": int(tlc["num_attention_heads"]),

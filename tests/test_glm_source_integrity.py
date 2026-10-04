@@ -70,7 +70,8 @@ def test_the_shipped_dspark_checkpoint_parses(allocations):  # noqa: F811
     assert mod.drafter_kind(folder) == "dspark"
     c = mod.read_speculators_config(cfg)
     assert (c["block"], c["mask_id"], c["vocab"]) == (8, 154856, 154880)
-    assert c["taps"] == (20, 28, 32, 36, 40, 44)
+    assert c["taps"] == (19, 27, 31, 35, 39, 43)     # the config's aux ids [20, 28, 32, 36, 40, 44] in this engine's
+    # post-layer tap convention (HF output_hidden_states id L = the state entering layer L = this engine's L - 1)
     assert (c["markov_rank"], c["confidence"], c["anchor_drafts"], c["causal"]) == (256, True, True, True)
     assert c["hidden"] + c["markov_rank"] == 4352                # the confidence head's input width
     assert mod.drafter_taps(folder) == 6                          # the two-rank parity input

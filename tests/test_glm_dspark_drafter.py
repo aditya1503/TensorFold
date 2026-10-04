@@ -138,7 +138,7 @@ def test_tap_counts_read_both_layouts_for_rank_parity(tmp_path, allocations):  #
 def test_config_maps_the_speculators_fields(allocations):  # noqa: F811
     mod = load_module()
     c = mod.read_speculators_config(dspark_config())
-    assert (c["block"], c["mask_id"], c["taps"]) == (4, 126, (1, 2, 3))
+    assert (c["block"], c["mask_id"], c["taps"]) == (4, 126, (0, 1, 2))   # aux [1,2,3] in the engine's post-layer taps
     assert (c["hidden"], c["hd"], c["heads"], c["kv_heads"], c["inter"], c["layers"]) == (64, 16, 8, 8, 128, 2)
     assert (c["window"], c["causal"], c["vocab"]) == (31, True, 128)
     assert (c["markov_rank"], c["confidence"], c["anchor_drafts"]) == (8, True, True)
@@ -164,7 +164,7 @@ def test_loader_maps_tensors_and_sizes_buffers(tmp_path, allocations, monkeypatc
     monkeypatch.delenv("TF_GLM_DSPARK_TOP_K", raising=False)
     monkeypatch.delenv("TF_GLM_DRAFT_QUANT", raising=False)
     d = mod.DSparkDrafter(tiny_checkpoint(tmp_path), fake_weights(), capacity=64)
-    assert (d.block, d.mask_id, d.tap_layers) == (4, 126, (1, 2, 3))
+    assert (d.block, d.mask_id, d.tap_layers) == (4, 126, (0, 1, 2))
     assert (d.D, d.hd, d.heads, d.kvh, d.inter) == (64, 16, 8, 8, 128)
     assert d.window == 31 and d.causal and d.anchor_drafts
     assert d.top_k == mod.DEFAULT_TOP_K and len(d.layers) == 2
